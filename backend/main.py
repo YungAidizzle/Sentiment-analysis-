@@ -88,6 +88,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Verify DB connection/schema and exit.",
     )
+    parser.add_argument(
+        "--aggregate-1m",
+        action="store_true",
+        help="Aggregate raw_posts into metric_buckets_1m and exit.",
+    )
+    parser.add_argument(
+        "--aggregate-1h",
+        action="store_true",
+        help="Aggregate raw_posts into metric_buckets_1h and exit.",
+    )
     return parser.parse_args()
 
 
@@ -125,6 +135,52 @@ def main() -> int:
         log_event(logger, logging.INFO, "db_verify_succeeded", source=source)
         store.close()
         return 0
+
+    if args.aggregate_1m or args.aggregate_1h:
+        try:
+            store.ensure_metric_bucket_tables()
+            rows_1m = 0
+            rows_1h = 0
+            if args.aggregate_1m:
+                rows_1m = store.aggregate_metric_buckets_1m()
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "aggregation_complete_1m",
+                    source=source,
+                    rows_affected=rows_1m,
+                )
+            if args.aggregate_1h:
+                rows_1h = store.aggregate_metric_buckets_1h()
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "aggregation_complete_1h",
+                    source=source,
+                    rows_affected=rows_1h,
+                )
+            log_event(
+                logger,
+                logging.INFO,
+                "aggregation_finished",
+                source=source,
+                aggregate_1m=args.aggregate_1m,
+                aggregate_1h=args.aggregate_1h,
+                rows_1m=rows_1m,
+                rows_1h=rows_1h,
+            )
+            store.close()
+            return 0
+        except Exception as error:
+            log_event(
+                logger,
+                logging.ERROR,
+                "aggregation_failed",
+                source=source,
+                error=str(error),
+            )
+            store.close()
+            return 1
 
     started_at = _utc_now()
     rows_inserted_total = 0

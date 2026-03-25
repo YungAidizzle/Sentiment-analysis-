@@ -298,6 +298,109 @@ class PostgresStore:
 
         return self._execute_write("upsert_authors", operation)
 
+    def ensure_metric_bucket_tables(self) -> None:
+        def operation(connection: psycopg.Connection[Any]) -> None:
+            lock_key = 9_148_221
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
+                try:
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS metric_buckets_1m (
+                            bucket_start TIMESTAMPTZ NOT NULL,
+                            platform TEXT NOT NULL,
+                            mention_count BIGINT NOT NULL,
+                            unique_authors BIGINT NOT NULL,
+                            PRIMARY KEY (bucket_start, platform)
+                        )
+                        """
+                    )
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS metric_buckets_1h (
+                            bucket_start TIMESTAMPTZ NOT NULL,
+                            platform TEXT NOT NULL,
+                            mention_count BIGINT NOT NULL,
+                            unique_authors BIGINT NOT NULL,
+                            PRIMARY KEY (bucket_start, platform)
+                        )
+                        """
+                    )
+                    cursor.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_metric_buckets_1m_platform_bucket
+                        ON metric_buckets_1m (platform, bucket_start DESC)
+                        """
+                    )
+                    cursor.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_metric_buckets_1h_platform_bucket
+                        ON metric_buckets_1h (platform, bucket_start DESC)
+                        """
+                    )
+                finally:
+                    cursor.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+
+        self._execute_write("ensure_metric_bucket_tables", operation)
+
+    def aggregate_metric_buckets_1m(self) -> int:
+        def operation(connection: psycopg.Connection[Any]) -> int:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO metric_buckets_1m (
+                        bucket_start,
+                        platform,
+                        mention_count,
+                        unique_authors
+                    )
+                    SELECT
+                        date_trunc('minute', created_at) AS bucket_start,
+                        platform,
+                        COUNT(*)::BIGINT AS mention_count,
+                        COUNT(DISTINCT author_id)::BIGINT AS unique_authors
+                    FROM raw_posts
+                    WHERE created_at IS NOT NULL
+                      AND platform IS NOT NULL
+                    GROUP BY 1, 2
+                    ON CONFLICT (bucket_start, platform) DO UPDATE
+                    SET mention_count = EXCLUDED.mention_count,
+                        unique_authors = EXCLUDED.unique_authors
+                    """
+                )
+                return int(cursor.rowcount or 0)
+
+        return self._execute_write("aggregate_metric_buckets_1m", operation)
+
+    def aggregate_metric_buckets_1h(self) -> int:
+        def operation(connection: psycopg.Connection[Any]) -> int:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO metric_buckets_1h (
+                        bucket_start,
+                        platform,
+                        mention_count,
+                        unique_authors
+                    )
+                    SELECT
+                        date_trunc('hour', created_at) AS bucket_start,
+                        platform,
+                        COUNT(*)::BIGINT AS mention_count,
+                        COUNT(DISTINCT author_id)::BIGINT AS unique_authors
+                    FROM raw_posts
+                    WHERE created_at IS NOT NULL
+                      AND platform IS NOT NULL
+                    GROUP BY 1, 2
+                    ON CONFLICT (bucket_start, platform) DO UPDATE
+                    SET mention_count = EXCLUDED.mention_count,
+                        unique_authors = EXCLUDED.unique_authors
+                    """
+                )
+                return int(cursor.rowcount or 0)
+
+        return self._execute_write("aggregate_metric_buckets_1h", operation)
+
     def _prepare_raw_post_row(self, row: dict[str, Any]) -> dict[str, Any]:
         ingested_at = row.get("ingested_at")
         if ingested_at is None:

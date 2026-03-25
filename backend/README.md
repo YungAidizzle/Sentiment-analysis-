@@ -44,6 +44,13 @@ DB/schema verification only:
 python -m backend.main --verify-db-only
 ```
 
+Time-bucket aggregation runs:
+
+```bash
+python -m backend.main --aggregate-1m
+python -m backend.main --aggregate-1h
+```
+
 ## Railway Deploy
 
 Use `backend/Dockerfile` for the worker service.

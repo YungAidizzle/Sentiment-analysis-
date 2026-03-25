@@ -202,6 +202,55 @@ class WorkerDbTests(unittest.TestCase):
         query, _payload = fake_connection.executemany_calls[0]
         self.assertIn("ON CONFLICT (platform, author_id) DO UPDATE", query)
 
+    @patch("backend.db.psycopg.connect")
+    def test_ensure_metric_bucket_tables_creates_required_tables(self, connect_mock):
+        fake_connection = FakeConnection()
+        connect_mock.return_value = fake_connection
+        store = PostgresStore(
+            database_url="postgresql://example",
+            batch_size=50,
+        )
+
+        store.ensure_metric_bucket_tables()
+
+        queries = [str(query) for query, _params in fake_connection.execute_calls]
+        self.assertTrue(any("CREATE TABLE IF NOT EXISTS metric_buckets_1m" in query for query in queries))
+        self.assertTrue(any("CREATE TABLE IF NOT EXISTS metric_buckets_1h" in query for query in queries))
+
+    @patch("backend.db.psycopg.connect")
+    def test_aggregate_metric_buckets_1m_uses_upsert(self, connect_mock):
+        fake_connection = FakeConnection()
+        connect_mock.return_value = fake_connection
+        store = PostgresStore(
+            database_url="postgresql://example",
+            batch_size=50,
+        )
+
+        affected = store.aggregate_metric_buckets_1m()
+
+        self.assertGreaterEqual(affected, 1)
+        queries = [str(query) for query, _params in fake_connection.execute_calls]
+        aggregate_query = next(query for query in queries if "INSERT INTO metric_buckets_1m" in query)
+        self.assertIn("date_trunc('minute', created_at)", aggregate_query)
+        self.assertIn("ON CONFLICT (bucket_start, platform) DO UPDATE", aggregate_query)
+
+    @patch("backend.db.psycopg.connect")
+    def test_aggregate_metric_buckets_1h_uses_upsert(self, connect_mock):
+        fake_connection = FakeConnection()
+        connect_mock.return_value = fake_connection
+        store = PostgresStore(
+            database_url="postgresql://example",
+            batch_size=50,
+        )
+
+        affected = store.aggregate_metric_buckets_1h()
+
+        self.assertGreaterEqual(affected, 1)
+        queries = [str(query) for query, _params in fake_connection.execute_calls]
+        aggregate_query = next(query for query in queries if "INSERT INTO metric_buckets_1h" in query)
+        self.assertIn("date_trunc('hour', created_at)", aggregate_query)
+        self.assertIn("ON CONFLICT (bucket_start, platform) DO UPDATE", aggregate_query)
+
 
 if __name__ == "__main__":
     unittest.main()
