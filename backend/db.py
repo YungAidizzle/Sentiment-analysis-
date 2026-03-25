@@ -57,6 +57,7 @@ class PostgresStore:
             return
         self._conn = psycopg.connect(self._database_url)
         self._conn.autocommit = False
+        self._ensure_core_tables()
         self._load_column_metadata()
         self._verify_required_schema()
 
@@ -298,48 +299,220 @@ class PostgresStore:
 
         return self._execute_write("upsert_authors", operation)
 
+    def _ensure_core_tables(self) -> None:
+        if self._conn is None:
+            return
+
+        with self._conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS raw_posts (
+                    platform TEXT NOT NULL,
+                    post_id TEXT NOT NULL,
+                    author_id TEXT,
+                    author_handle TEXT,
+                    root_post_id TEXT,
+                    reply_parent_id TEXT,
+                    created_at TIMESTAMPTZ,
+                    ingested_at TIMESTAMPTZ,
+                    text_content TEXT,
+                    language TEXT,
+                    urls TEXT[],
+                    hashtags TEXT[],
+                    metrics_json JSONB,
+                    raw_json JSONB
+                )
+                """
+            )
+            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS platform TEXT")
+            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS post_id TEXT")
+            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS author_id TEXT")
+            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS author_handle TEXT")
+            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS root_post_id TEXT")
+            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS reply_parent_id TEXT")
+            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS ingested_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS text_content TEXT")
+            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS language TEXT")
+            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS urls TEXT[]")
+            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS hashtags TEXT[]")
+            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS metrics_json JSONB")
+            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS raw_json JSONB")
+
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS authors (
+                    platform TEXT NOT NULL,
+                    author_id TEXT NOT NULL,
+                    author_handle TEXT,
+                    display_name TEXT,
+                    followers_count BIGINT,
+                    metadata_json JSONB,
+                    first_seen_at TIMESTAMPTZ,
+                    last_seen_at TIMESTAMPTZ
+                )
+                """
+            )
+            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS platform TEXT")
+            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS author_id TEXT")
+            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS author_handle TEXT")
+            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS display_name TEXT")
+            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS followers_count BIGINT")
+            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS metadata_json JSONB")
+            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
+
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ingestion_runs (
+                    source TEXT NOT NULL,
+                    started_at TIMESTAMPTZ NOT NULL,
+                    ended_at TIMESTAMPTZ,
+                    status TEXT,
+                    rows_inserted BIGINT NOT NULL DEFAULT 0,
+                    notes JSONB
+                )
+                """
+            )
+            cursor.execute("ALTER TABLE ingestion_runs ADD COLUMN IF NOT EXISTS source TEXT")
+            cursor.execute("ALTER TABLE ingestion_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE ingestion_runs ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE ingestion_runs ADD COLUMN IF NOT EXISTS status TEXT")
+            cursor.execute("ALTER TABLE ingestion_runs ADD COLUMN IF NOT EXISTS rows_inserted BIGINT")
+            cursor.execute("ALTER TABLE ingestion_runs ADD COLUMN IF NOT EXISTS notes JSONB")
+
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_posts_platform_post_id
+                ON raw_posts (platform, post_id)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_authors_platform_author_id
+                ON authors (platform, author_id)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_ingestion_runs_source_started_at
+                ON ingestion_runs (source, started_at)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_raw_posts_created_at
+                ON raw_posts (created_at)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_raw_posts_platform_created_at
+                ON raw_posts (platform, created_at DESC)
+                """
+            )
+
+        self._conn.commit()
+
     def ensure_metric_bucket_tables(self) -> None:
         def operation(connection: psycopg.Connection[Any]) -> None:
             lock_key = 9_148_221
             with connection.cursor() as cursor:
-                cursor.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
-                try:
-                    cursor.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS metric_buckets_1m (
-                            bucket_start TIMESTAMPTZ NOT NULL,
-                            platform TEXT NOT NULL,
-                            mention_count BIGINT NOT NULL,
-                            unique_authors BIGINT NOT NULL,
-                            PRIMARY KEY (bucket_start, platform)
-                        )
-                        """
+                cursor.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS metric_buckets_1m (
+                        bucket_start TIMESTAMPTZ NOT NULL,
+                        platform TEXT NOT NULL,
+                        mention_count BIGINT NOT NULL,
+                        unique_authors BIGINT NOT NULL,
+                        PRIMARY KEY (bucket_start, platform)
                     )
-                    cursor.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS metric_buckets_1h (
-                            bucket_start TIMESTAMPTZ NOT NULL,
-                            platform TEXT NOT NULL,
-                            mention_count BIGINT NOT NULL,
-                            unique_authors BIGINT NOT NULL,
-                            PRIMARY KEY (bucket_start, platform)
-                        )
-                        """
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE metric_buckets_1m
+                    ADD COLUMN IF NOT EXISTS bucket_start TIMESTAMPTZ
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE metric_buckets_1m
+                    ADD COLUMN IF NOT EXISTS platform TEXT
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE metric_buckets_1m
+                    ADD COLUMN IF NOT EXISTS mention_count BIGINT
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE metric_buckets_1m
+                    ADD COLUMN IF NOT EXISTS unique_authors BIGINT
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS metric_buckets_1h (
+                        bucket_start TIMESTAMPTZ NOT NULL,
+                        platform TEXT NOT NULL,
+                        mention_count BIGINT NOT NULL,
+                        unique_authors BIGINT NOT NULL,
+                        PRIMARY KEY (bucket_start, platform)
                     )
-                    cursor.execute(
-                        """
-                        CREATE INDEX IF NOT EXISTS idx_metric_buckets_1m_platform_bucket
-                        ON metric_buckets_1m (platform, bucket_start DESC)
-                        """
-                    )
-                    cursor.execute(
-                        """
-                        CREATE INDEX IF NOT EXISTS idx_metric_buckets_1h_platform_bucket
-                        ON metric_buckets_1h (platform, bucket_start DESC)
-                        """
-                    )
-                finally:
-                    cursor.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE metric_buckets_1h
+                    ADD COLUMN IF NOT EXISTS bucket_start TIMESTAMPTZ
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE metric_buckets_1h
+                    ADD COLUMN IF NOT EXISTS platform TEXT
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE metric_buckets_1h
+                    ADD COLUMN IF NOT EXISTS mention_count BIGINT
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE metric_buckets_1h
+                    ADD COLUMN IF NOT EXISTS unique_authors BIGINT
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_metric_buckets_1m_bucket_platform
+                    ON metric_buckets_1m (bucket_start, platform)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_metric_buckets_1h_bucket_platform
+                    ON metric_buckets_1h (bucket_start, platform)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_metric_buckets_1m_platform_bucket
+                    ON metric_buckets_1m (platform, bucket_start DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_metric_buckets_1h_platform_bucket
+                    ON metric_buckets_1h (platform, bucket_start DESC)
+                    """
+                )
 
         self._execute_write("ensure_metric_bucket_tables", operation)
 
