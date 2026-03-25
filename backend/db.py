@@ -83,7 +83,7 @@ class PostgresStore:
                 cursor.execute(
                     """
                     SELECT notes
-                    FROM ingestion_runs
+                    FROM public.ingestion_runs
                     WHERE source = %s
                     ORDER BY started_at DESC
                     LIMIT 1
@@ -114,7 +114,7 @@ class PostgresStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    INSERT INTO ingestion_runs (
+                    INSERT INTO public.ingestion_runs (
                         source,
                         started_at,
                         status,
@@ -148,7 +148,7 @@ class PostgresStore:
                 if ended_at is None:
                     cursor.execute(
                         """
-                        UPDATE ingestion_runs
+                        UPDATE public.ingestion_runs
                         SET status = %s,
                             rows_inserted = %s,
                             notes = %s
@@ -166,7 +166,7 @@ class PostgresStore:
                 else:
                     cursor.execute(
                         """
-                        UPDATE ingestion_runs
+                        UPDATE public.ingestion_runs
                         SET ended_at = %s,
                             status = %s,
                             rows_inserted = %s,
@@ -203,38 +203,86 @@ class PostgresStore:
                 for chunk in _chunked(payload, self._batch_size):
                     cursor.executemany(
                         """
-                        INSERT INTO raw_posts (
+                        INSERT INTO public.raw_posts (
                             platform,
+                            source_post_id,
+                            source_uri,
+                            source_cid,
+                            author_did,
                             post_id,
                             author_id,
                             author_handle,
                             root_post_id,
                             reply_parent_id,
                             created_at,
+                            inserted_at,
                             ingested_at,
+                            raw_text,
                             text_content,
                             language,
                             urls,
                             hashtags,
+                            like_count,
+                            repost_count,
+                            reply_count,
+                            reply_to_uri,
+                            repost_of_uri,
+                            processed,
                             metrics_json,
                             raw_json
                         ) VALUES (
                             %(platform)s,
+                            %(source_post_id)s,
+                            %(source_uri)s,
+                            %(source_cid)s,
+                            %(author_did)s,
                             %(post_id)s,
                             %(author_id)s,
                             %(author_handle)s,
                             %(root_post_id)s,
                             %(reply_parent_id)s,
                             %(created_at)s,
+                            %(inserted_at)s,
                             %(ingested_at)s,
+                            %(raw_text)s,
                             %(text_content)s,
                             %(language)s,
                             %(urls)s,
                             %(hashtags)s,
+                            %(like_count)s,
+                            %(repost_count)s,
+                            %(reply_count)s,
+                            %(reply_to_uri)s,
+                            %(repost_of_uri)s,
+                            %(processed)s,
                             %(metrics_json)s,
                             %(raw_json)s
                         )
-                        ON CONFLICT (platform, post_id) DO NOTHING
+                        ON CONFLICT (platform, source_post_id) DO UPDATE
+                        SET source_uri = COALESCE(EXCLUDED.source_uri, public.raw_posts.source_uri),
+                            source_cid = COALESCE(EXCLUDED.source_cid, public.raw_posts.source_cid),
+                            author_did = COALESCE(EXCLUDED.author_did, public.raw_posts.author_did),
+                            author_id = COALESCE(EXCLUDED.author_id, public.raw_posts.author_id),
+                            author_handle = COALESCE(EXCLUDED.author_handle, public.raw_posts.author_handle),
+                            root_post_id = COALESCE(EXCLUDED.root_post_id, public.raw_posts.root_post_id),
+                            reply_parent_id = COALESCE(EXCLUDED.reply_parent_id, public.raw_posts.reply_parent_id),
+                            created_at = COALESCE(EXCLUDED.created_at, public.raw_posts.created_at),
+                            ingested_at = COALESCE(EXCLUDED.ingested_at, public.raw_posts.ingested_at),
+                            inserted_at = COALESCE(EXCLUDED.inserted_at, public.raw_posts.inserted_at),
+                            raw_text = COALESCE(EXCLUDED.raw_text, public.raw_posts.raw_text),
+                            text_content = COALESCE(EXCLUDED.text_content, public.raw_posts.text_content),
+                            language = COALESCE(EXCLUDED.language, public.raw_posts.language),
+                            urls = COALESCE(EXCLUDED.urls, public.raw_posts.urls),
+                            hashtags = COALESCE(EXCLUDED.hashtags, public.raw_posts.hashtags),
+                            like_count = COALESCE(EXCLUDED.like_count, public.raw_posts.like_count),
+                            repost_count = COALESCE(EXCLUDED.repost_count, public.raw_posts.repost_count),
+                            reply_count = COALESCE(EXCLUDED.reply_count, public.raw_posts.reply_count),
+                            reply_to_uri = COALESCE(EXCLUDED.reply_to_uri, public.raw_posts.reply_to_uri),
+                            repost_of_uri = COALESCE(EXCLUDED.repost_of_uri, public.raw_posts.repost_of_uri),
+                            processed = COALESCE(EXCLUDED.processed, public.raw_posts.processed),
+                            metrics_json = COALESCE(EXCLUDED.metrics_json, public.raw_posts.metrics_json),
+                            raw_json = COALESCE(EXCLUDED.raw_json, public.raw_posts.raw_json),
+                            post_id = COALESCE(EXCLUDED.post_id, public.raw_posts.post_id)
                         """,
                         list(chunk),
                     )
@@ -256,7 +304,7 @@ class PostgresStore:
                 for chunk in _chunked(payload, self._batch_size):
                     cursor.executemany(
                         """
-                        INSERT INTO authors (
+                        INSERT INTO public.authors (
                             platform,
                             author_id,
                             author_handle,
@@ -276,19 +324,19 @@ class PostgresStore:
                             %(last_seen_at)s
                         )
                         ON CONFLICT (platform, author_id) DO UPDATE
-                        SET author_handle = COALESCE(EXCLUDED.author_handle, authors.author_handle),
-                            display_name = COALESCE(EXCLUDED.display_name, authors.display_name),
-                            followers_count = COALESCE(EXCLUDED.followers_count, authors.followers_count),
-                            metadata_json = COALESCE(EXCLUDED.metadata_json, authors.metadata_json),
+                        SET author_handle = COALESCE(EXCLUDED.author_handle, public.authors.author_handle),
+                            display_name = COALESCE(EXCLUDED.display_name, public.authors.display_name),
+                            followers_count = COALESCE(EXCLUDED.followers_count, public.authors.followers_count),
+                            metadata_json = COALESCE(EXCLUDED.metadata_json, public.authors.metadata_json),
                             first_seen_at = CASE
-                                WHEN authors.first_seen_at IS NULL THEN EXCLUDED.first_seen_at
-                                WHEN EXCLUDED.first_seen_at IS NULL THEN authors.first_seen_at
-                                ELSE LEAST(authors.first_seen_at, EXCLUDED.first_seen_at)
+                                WHEN public.authors.first_seen_at IS NULL THEN EXCLUDED.first_seen_at
+                                WHEN EXCLUDED.first_seen_at IS NULL THEN public.authors.first_seen_at
+                                ELSE LEAST(public.authors.first_seen_at, EXCLUDED.first_seen_at)
                             END,
                             last_seen_at = CASE
-                                WHEN authors.last_seen_at IS NULL THEN EXCLUDED.last_seen_at
-                                WHEN EXCLUDED.last_seen_at IS NULL THEN authors.last_seen_at
-                                ELSE GREATEST(authors.last_seen_at, EXCLUDED.last_seen_at)
+                                WHEN public.authors.last_seen_at IS NULL THEN EXCLUDED.last_seen_at
+                                WHEN EXCLUDED.last_seen_at IS NULL THEN public.authors.last_seen_at
+                                ELSE GREATEST(public.authors.last_seen_at, EXCLUDED.last_seen_at)
                             END
                         """,
                         list(chunk),
@@ -306,42 +354,66 @@ class PostgresStore:
         with self._conn.cursor() as cursor:
             cursor.execute(
                 """
-                CREATE TABLE IF NOT EXISTS raw_posts (
+                CREATE TABLE IF NOT EXISTS public.raw_posts (
                     platform TEXT NOT NULL,
+                    source_post_id TEXT,
+                    source_uri TEXT,
+                    source_cid TEXT,
+                    author_did TEXT,
                     post_id TEXT NOT NULL,
                     author_id TEXT,
                     author_handle TEXT,
                     root_post_id TEXT,
                     reply_parent_id TEXT,
                     created_at TIMESTAMPTZ,
+                    inserted_at TIMESTAMPTZ DEFAULT now(),
                     ingested_at TIMESTAMPTZ,
+                    raw_text TEXT,
                     text_content TEXT,
                     language TEXT,
                     urls TEXT[],
                     hashtags TEXT[],
+                    like_count INTEGER,
+                    repost_count INTEGER,
+                    reply_count INTEGER,
+                    reply_to_uri TEXT,
+                    repost_of_uri TEXT,
+                    processed BOOLEAN NOT NULL DEFAULT false,
                     metrics_json JSONB,
                     raw_json JSONB
                 )
                 """
             )
-            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS platform TEXT")
-            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS post_id TEXT")
-            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS author_id TEXT")
-            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS author_handle TEXT")
-            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS root_post_id TEXT")
-            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS reply_parent_id TEXT")
-            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
-            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS ingested_at TIMESTAMPTZ")
-            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS text_content TEXT")
-            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS language TEXT")
-            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS urls TEXT[]")
-            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS hashtags TEXT[]")
-            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS metrics_json JSONB")
-            cursor.execute("ALTER TABLE raw_posts ADD COLUMN IF NOT EXISTS raw_json JSONB")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS platform TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS source_post_id TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS source_uri TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS source_cid TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS author_did TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS post_id TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS author_id TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS author_handle TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS root_post_id TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS reply_parent_id TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS inserted_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS ingested_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS raw_text TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS text_content TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS language TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS urls TEXT[]")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS hashtags TEXT[]")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS like_count INTEGER")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS repost_count INTEGER")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS reply_count INTEGER")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS reply_to_uri TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS repost_of_uri TEXT")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS processed BOOLEAN")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS metrics_json JSONB")
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS raw_json JSONB")
 
             cursor.execute(
                 """
-                CREATE TABLE IF NOT EXISTS authors (
+                CREATE TABLE IF NOT EXISTS public.authors (
                     platform TEXT NOT NULL,
                     author_id TEXT NOT NULL,
                     author_handle TEXT,
@@ -353,18 +425,18 @@ class PostgresStore:
                 )
                 """
             )
-            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS platform TEXT")
-            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS author_id TEXT")
-            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS author_handle TEXT")
-            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS display_name TEXT")
-            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS followers_count BIGINT")
-            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS metadata_json JSONB")
-            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ")
-            cursor.execute("ALTER TABLE authors ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE public.authors ADD COLUMN IF NOT EXISTS platform TEXT")
+            cursor.execute("ALTER TABLE public.authors ADD COLUMN IF NOT EXISTS author_id TEXT")
+            cursor.execute("ALTER TABLE public.authors ADD COLUMN IF NOT EXISTS author_handle TEXT")
+            cursor.execute("ALTER TABLE public.authors ADD COLUMN IF NOT EXISTS display_name TEXT")
+            cursor.execute("ALTER TABLE public.authors ADD COLUMN IF NOT EXISTS followers_count BIGINT")
+            cursor.execute("ALTER TABLE public.authors ADD COLUMN IF NOT EXISTS metadata_json JSONB")
+            cursor.execute("ALTER TABLE public.authors ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE public.authors ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
 
             cursor.execute(
                 """
-                CREATE TABLE IF NOT EXISTS ingestion_runs (
+                CREATE TABLE IF NOT EXISTS public.ingestion_runs (
                     source TEXT NOT NULL,
                     started_at TIMESTAMPTZ NOT NULL,
                     ended_at TIMESTAMPTZ,
@@ -374,41 +446,47 @@ class PostgresStore:
                 )
                 """
             )
-            cursor.execute("ALTER TABLE ingestion_runs ADD COLUMN IF NOT EXISTS source TEXT")
-            cursor.execute("ALTER TABLE ingestion_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ")
-            cursor.execute("ALTER TABLE ingestion_runs ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ")
-            cursor.execute("ALTER TABLE ingestion_runs ADD COLUMN IF NOT EXISTS status TEXT")
-            cursor.execute("ALTER TABLE ingestion_runs ADD COLUMN IF NOT EXISTS rows_inserted BIGINT")
-            cursor.execute("ALTER TABLE ingestion_runs ADD COLUMN IF NOT EXISTS notes JSONB")
+            cursor.execute("ALTER TABLE public.ingestion_runs ADD COLUMN IF NOT EXISTS source TEXT")
+            cursor.execute("ALTER TABLE public.ingestion_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE public.ingestion_runs ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE public.ingestion_runs ADD COLUMN IF NOT EXISTS status TEXT")
+            cursor.execute("ALTER TABLE public.ingestion_runs ADD COLUMN IF NOT EXISTS rows_inserted BIGINT")
+            cursor.execute("ALTER TABLE public.ingestion_runs ADD COLUMN IF NOT EXISTS notes JSONB")
 
             cursor.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_posts_platform_post_id
-                ON raw_posts (platform, post_id)
+                ON public.raw_posts (platform, post_id)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS raw_posts_platform_source_post_id_idx
+                ON public.raw_posts (platform, source_post_id)
                 """
             )
             cursor.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_authors_platform_author_id
-                ON authors (platform, author_id)
+                ON public.authors (platform, author_id)
                 """
             )
             cursor.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_ingestion_runs_source_started_at
-                ON ingestion_runs (source, started_at)
+                ON public.ingestion_runs (source, started_at)
                 """
             )
             cursor.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_raw_posts_created_at
-                ON raw_posts (created_at)
+                ON public.raw_posts (created_at)
                 """
             )
             cursor.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_raw_posts_platform_created_at
-                ON raw_posts (platform, created_at DESC)
+                ON public.raw_posts (platform, created_at DESC)
                 """
             )
 
@@ -421,7 +499,7 @@ class PostgresStore:
                 cursor.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
                 cursor.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS metric_buckets_1m (
+                    CREATE TABLE IF NOT EXISTS public.metric_buckets_1m (
                         bucket_start TIMESTAMPTZ NOT NULL,
                         platform TEXT NOT NULL,
                         mention_count BIGINT NOT NULL,
@@ -432,31 +510,85 @@ class PostgresStore:
                 )
                 cursor.execute(
                     """
-                    ALTER TABLE metric_buckets_1m
+                    ALTER TABLE public.metric_buckets_1m
                     ADD COLUMN IF NOT EXISTS bucket_start TIMESTAMPTZ
                     """
                 )
                 cursor.execute(
                     """
-                    ALTER TABLE metric_buckets_1m
+                    ALTER TABLE public.metric_buckets_1m
+                    ADD COLUMN IF NOT EXISTS bucket_minute TIMESTAMPTZ
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE public.metric_buckets_1m
                     ADD COLUMN IF NOT EXISTS platform TEXT
                     """
                 )
                 cursor.execute(
                     """
-                    ALTER TABLE metric_buckets_1m
+                    ALTER TABLE public.metric_buckets_1m
                     ADD COLUMN IF NOT EXISTS mention_count BIGINT
                     """
                 )
                 cursor.execute(
                     """
-                    ALTER TABLE metric_buckets_1m
+                    ALTER TABLE public.metric_buckets_1m
+                    ADD COLUMN IF NOT EXISTS raw_post_count INTEGER
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE public.metric_buckets_1m
+                    ADD COLUMN IF NOT EXISTS processed_post_count INTEGER
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE public.metric_buckets_1m
                     ADD COLUMN IF NOT EXISTS unique_authors BIGINT
                     """
                 )
                 cursor.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS metric_buckets_1h (
+                    ALTER TABLE public.metric_buckets_1m
+                    ADD COLUMN IF NOT EXISTS reply_count INTEGER
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE public.metric_buckets_1m
+                    ADD COLUMN IF NOT EXISTS repost_count INTEGER
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE public.metric_buckets_1m
+                    ADD COLUMN IF NOT EXISTS link_post_count INTEGER
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE public.metric_buckets_1m
+                    ADD COLUMN IF NOT EXISTS media_post_count INTEGER
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE public.metric_buckets_1m
+                    ADD COLUMN IF NOT EXISTS avg_quality_score NUMERIC
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE public.metric_buckets_1m
+                    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.metric_buckets_1h (
                         bucket_start TIMESTAMPTZ NOT NULL,
                         platform TEXT NOT NULL,
                         mention_count BIGINT NOT NULL,
@@ -467,50 +599,56 @@ class PostgresStore:
                 )
                 cursor.execute(
                     """
-                    ALTER TABLE metric_buckets_1h
+                    ALTER TABLE public.metric_buckets_1h
                     ADD COLUMN IF NOT EXISTS bucket_start TIMESTAMPTZ
                     """
                 )
                 cursor.execute(
                     """
-                    ALTER TABLE metric_buckets_1h
+                    ALTER TABLE public.metric_buckets_1h
                     ADD COLUMN IF NOT EXISTS platform TEXT
                     """
                 )
                 cursor.execute(
                     """
-                    ALTER TABLE metric_buckets_1h
+                    ALTER TABLE public.metric_buckets_1h
                     ADD COLUMN IF NOT EXISTS mention_count BIGINT
                     """
                 )
                 cursor.execute(
                     """
-                    ALTER TABLE metric_buckets_1h
+                    ALTER TABLE public.metric_buckets_1h
                     ADD COLUMN IF NOT EXISTS unique_authors BIGINT
                     """
                 )
                 cursor.execute(
                     """
                     CREATE UNIQUE INDEX IF NOT EXISTS uq_metric_buckets_1m_bucket_platform
-                    ON metric_buckets_1m (bucket_start, platform)
+                    ON public.metric_buckets_1m (bucket_start, platform)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS metric_buckets_1m_pkey
+                    ON public.metric_buckets_1m (bucket_minute, platform)
                     """
                 )
                 cursor.execute(
                     """
                     CREATE UNIQUE INDEX IF NOT EXISTS uq_metric_buckets_1h_bucket_platform
-                    ON metric_buckets_1h (bucket_start, platform)
+                    ON public.metric_buckets_1h (bucket_start, platform)
                     """
                 )
                 cursor.execute(
                     """
                     CREATE INDEX IF NOT EXISTS idx_metric_buckets_1m_platform_bucket
-                    ON metric_buckets_1m (platform, bucket_start DESC)
+                    ON public.metric_buckets_1m (platform, bucket_start DESC)
                     """
                 )
                 cursor.execute(
                     """
                     CREATE INDEX IF NOT EXISTS idx_metric_buckets_1h_platform_bucket
-                    ON metric_buckets_1h (platform, bucket_start DESC)
+                    ON public.metric_buckets_1h (platform, bucket_start DESC)
                     """
                 )
 
@@ -521,24 +659,51 @@ class PostgresStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    INSERT INTO metric_buckets_1m (
+                    INSERT INTO public.metric_buckets_1m (
+                        bucket_minute,
                         bucket_start,
                         platform,
+                        raw_post_count,
+                        processed_post_count,
                         mention_count,
-                        unique_authors
+                        unique_authors,
+                        reply_count,
+                        repost_count,
+                        link_post_count,
+                        media_post_count,
+                        avg_quality_score,
+                        created_at
                     )
                     SELECT
+                        date_trunc('minute', created_at) AS bucket_minute,
                         date_trunc('minute', created_at) AS bucket_start,
                         platform,
+                        COUNT(*)::INT AS raw_post_count,
+                        COUNT(*)::INT AS processed_post_count,
                         COUNT(*)::BIGINT AS mention_count,
-                        COUNT(DISTINCT author_id)::BIGINT AS unique_authors
-                    FROM raw_posts
+                        COUNT(DISTINCT author_id)::BIGINT AS unique_authors,
+                        SUM(CASE WHEN reply_parent_id IS NOT NULL THEN 1 ELSE 0 END)::INT AS reply_count,
+                        SUM(CASE WHEN repost_of_uri IS NOT NULL THEN 1 ELSE 0 END)::INT AS repost_count,
+                        SUM(CASE WHEN COALESCE(array_length(urls, 1), 0) > 0 THEN 1 ELSE 0 END)::INT AS link_post_count,
+                        0::INT AS media_post_count,
+                        0::NUMERIC AS avg_quality_score,
+                        now() AS created_at
+                    FROM public.raw_posts
                     WHERE created_at IS NOT NULL
                       AND platform IS NOT NULL
-                    GROUP BY 1, 2
-                    ON CONFLICT (bucket_start, platform) DO UPDATE
-                    SET mention_count = EXCLUDED.mention_count,
-                        unique_authors = EXCLUDED.unique_authors
+                    GROUP BY 1, 2, 3
+                    ON CONFLICT (bucket_minute, platform) DO UPDATE
+                    SET bucket_start = EXCLUDED.bucket_start,
+                        raw_post_count = EXCLUDED.raw_post_count,
+                        processed_post_count = EXCLUDED.processed_post_count,
+                        mention_count = EXCLUDED.mention_count,
+                        unique_authors = EXCLUDED.unique_authors,
+                        reply_count = EXCLUDED.reply_count,
+                        repost_count = EXCLUDED.repost_count,
+                        link_post_count = EXCLUDED.link_post_count,
+                        media_post_count = EXCLUDED.media_post_count,
+                        avg_quality_score = EXCLUDED.avg_quality_score,
+                        created_at = EXCLUDED.created_at
                     """
                 )
                 return int(cursor.rowcount or 0)
@@ -550,7 +715,7 @@ class PostgresStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    INSERT INTO metric_buckets_1h (
+                    INSERT INTO public.metric_buckets_1h (
                         bucket_start,
                         platform,
                         mention_count,
@@ -561,7 +726,7 @@ class PostgresStore:
                         platform,
                         COUNT(*)::BIGINT AS mention_count,
                         COUNT(DISTINCT author_id)::BIGINT AS unique_authors
-                    FROM raw_posts
+                    FROM public.raw_posts
                     WHERE created_at IS NOT NULL
                       AND platform IS NOT NULL
                     GROUP BY 1, 2
@@ -574,26 +739,316 @@ class PostgresStore:
 
         return self._execute_write("aggregate_metric_buckets_1h", operation)
 
+    def ensure_processed_topic_tables(self) -> None:
+        def operation(connection: psycopg.Connection[Any]) -> None:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.processed_posts (
+                        id BIGSERIAL PRIMARY KEY,
+                        raw_post_id BIGINT,
+                        platform TEXT NOT NULL,
+                        source_post_id TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        processed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        bucket_minute TIMESTAMPTZ NOT NULL,
+                        clean_text TEXT,
+                        normalized_text TEXT,
+                        language TEXT,
+                        has_media BOOLEAN NOT NULL DEFAULT false,
+                        is_reply BOOLEAN NOT NULL DEFAULT false,
+                        is_repost BOOLEAN NOT NULL DEFAULT false,
+                        is_quote BOOLEAN NOT NULL DEFAULT false,
+                        author_hash TEXT,
+                        token_count INTEGER NOT NULL DEFAULT 0,
+                        fingerprint TEXT,
+                        hashtags TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        cashtags TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        domains TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        urls TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        key_phrases TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        topic_seeds TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        spam_score NUMERIC NOT NULL DEFAULT 0,
+                        quality_score NUMERIC NOT NULL DEFAULT 0,
+                        post_id TEXT,
+                        author_id TEXT,
+                        topic TEXT
+                    )
+                    """
+                )
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS raw_post_id BIGINT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS platform TEXT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS source_post_id TEXT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS bucket_minute TIMESTAMPTZ")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS clean_text TEXT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS normalized_text TEXT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS language TEXT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS has_media BOOLEAN")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS is_reply BOOLEAN")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS is_repost BOOLEAN")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS is_quote BOOLEAN")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS author_hash TEXT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS token_count INTEGER")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS fingerprint TEXT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS hashtags TEXT[]")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS cashtags TEXT[]")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS domains TEXT[]")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS urls TEXT[]")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS key_phrases TEXT[]")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS topic_seeds TEXT[]")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS spam_score NUMERIC")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS quality_score NUMERIC")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS post_id TEXT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS author_id TEXT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS topic TEXT")
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.topic_buckets_1m (
+                        bucket_minute TIMESTAMPTZ NOT NULL,
+                        platform TEXT NOT NULL,
+                        topic_key TEXT NOT NULL,
+                        mention_count INTEGER NOT NULL,
+                        unique_authors INTEGER NOT NULL,
+                        total_quality_score NUMERIC NOT NULL DEFAULT 0,
+                        avg_quality_score NUMERIC NOT NULL DEFAULT 0,
+                        repost_count INTEGER NOT NULL DEFAULT 0,
+                        reply_count INTEGER NOT NULL DEFAULT 0,
+                        link_post_count INTEGER NOT NULL DEFAULT 0,
+                        sample_size INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        bucket_start TIMESTAMPTZ,
+                        topic TEXT,
+                        PRIMARY KEY (bucket_minute, platform, topic_key)
+                    )
+                    """
+                )
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS bucket_minute TIMESTAMPTZ")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS platform TEXT")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS topic_key TEXT")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS mention_count INTEGER")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS unique_authors INTEGER")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS total_quality_score NUMERIC")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS avg_quality_score NUMERIC")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS repost_count INTEGER")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS reply_count INTEGER")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS link_post_count INTEGER")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS sample_size INTEGER")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS bucket_start TIMESTAMPTZ")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS topic TEXT")
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_topic_buckets_1m_bucket_platform_topic
+                    ON public.topic_buckets_1m (bucket_minute, platform, topic_key)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_processed_posts_platform_source_post_id
+                    ON public.processed_posts (platform, source_post_id)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_processed_posts_created_at
+                    ON public.processed_posts (created_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_processed_posts_topic
+                    ON public.processed_posts (platform, source_post_id, created_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_topic_buckets_1m_platform_topic_bucket
+                    ON public.topic_buckets_1m (platform, topic_key, bucket_minute DESC)
+                    """
+                )
+
+        self._execute_write("ensure_processed_topic_tables", operation)
+
+    def refresh_processed_posts_from_raw_posts(self) -> int:
+        def operation(connection: psycopg.Connection[Any]) -> int:
+            with connection.cursor() as cursor:
+                cursor.execute("TRUNCATE TABLE public.processed_posts")
+                cursor.execute(
+                    """
+                    INSERT INTO public.processed_posts (
+                        platform,
+                        source_post_id,
+                        post_id,
+                        author_id,
+                        created_at,
+                        processed_at,
+                        bucket_minute,
+                        clean_text,
+                        normalized_text,
+                        language,
+                        has_media,
+                        is_reply,
+                        is_repost,
+                        is_quote,
+                        author_hash,
+                        token_count,
+                        hashtags,
+                        cashtags,
+                        domains,
+                        urls,
+                        key_phrases,
+                        topic_seeds,
+                        spam_score,
+                        quality_score,
+                        topic
+                    )
+                    SELECT
+                        rp.platform,
+                        COALESCE(rp.source_post_id, rp.post_id),
+                        rp.post_id,
+                        rp.author_id,
+                        rp.created_at,
+                        COALESCE(rp.ingested_at, rp.inserted_at, now()),
+                        date_trunc('minute', rp.created_at),
+                        COALESCE(rp.raw_text, rp.text_content),
+                        COALESCE(rp.raw_text, rp.text_content),
+                        rp.language,
+                        false,
+                        (rp.reply_parent_id IS NOT NULL),
+                        (rp.repost_of_uri IS NOT NULL),
+                        false,
+                        NULL::text,
+                        0,
+                        COALESCE(rp.hashtags, '{}'::text[]),
+                        '{}'::text[],
+                        '{}'::text[],
+                        COALESCE(rp.urls, '{}'::text[]),
+                        '{}'::text[],
+                        '{}'::text[],
+                        0::numeric,
+                        0::numeric,
+                        'all'::text AS topic
+                    FROM public.raw_posts rp
+                    WHERE rp.platform IS NOT NULL
+                      AND COALESCE(rp.source_post_id, rp.post_id) IS NOT NULL
+                      AND rp.created_at IS NOT NULL
+                    """
+                )
+                return int(cursor.rowcount or 0)
+
+        return self._execute_write("refresh_processed_posts_from_raw_posts", operation)
+
+    def aggregate_topic_buckets_1m_from_processed_posts(self) -> int:
+        def operation(connection: psycopg.Connection[Any]) -> int:
+            with connection.cursor() as cursor:
+                cursor.execute("TRUNCATE TABLE public.topic_buckets_1m")
+                cursor.execute(
+                    """
+                    INSERT INTO public.topic_buckets_1m (
+                        bucket_minute,
+                        platform,
+                        topic_key,
+                        mention_count,
+                        unique_authors,
+                        total_quality_score,
+                        avg_quality_score,
+                        repost_count,
+                        reply_count,
+                        link_post_count,
+                        sample_size,
+                        created_at,
+                        bucket_start,
+                        topic
+                    )
+                    SELECT
+                        date_trunc('minute', created_at) AS bucket_minute,
+                        platform,
+                        COALESCE(topic, 'all') AS topic_key,
+                        COUNT(*)::INT AS mention_count,
+                        COUNT(DISTINCT author_id)::INT AS unique_authors,
+                        COALESCE(SUM(COALESCE(quality_score, 0)), 0)::numeric AS total_quality_score,
+                        COALESCE(AVG(COALESCE(quality_score, 0)), 0)::numeric AS avg_quality_score,
+                        SUM(CASE WHEN is_repost THEN 1 ELSE 0 END)::INT AS repost_count,
+                        SUM(CASE WHEN is_reply THEN 1 ELSE 0 END)::INT AS reply_count,
+                        SUM(CASE WHEN COALESCE(array_length(urls, 1), 0) > 0 THEN 1 ELSE 0 END)::INT AS link_post_count,
+                        COUNT(*)::INT AS sample_size,
+                        now() AS created_at,
+                        date_trunc('minute', created_at) AS bucket_start,
+                        COALESCE(topic, 'all') AS topic
+                    FROM public.processed_posts
+                    WHERE created_at IS NOT NULL
+                      AND platform IS NOT NULL
+                      AND COALESCE(topic, 'all') <> ''
+                    GROUP BY 1, 2, 3
+                    """
+                )
+                return int(cursor.rowcount or 0)
+
+        return self._execute_write("aggregate_topic_buckets_1m_from_processed_posts", operation)
+
     def _prepare_raw_post_row(self, row: dict[str, Any]) -> dict[str, Any]:
         ingested_at = row.get("ingested_at")
         if ingested_at is None:
             ingested_at = datetime.now(timezone.utc)
         created_at = row.get("created_at") or ingested_at
+        raw_json_payload = row.get("raw_json") or {}
+        if not isinstance(raw_json_payload, dict):
+            raw_json_payload = {}
+        source_post_id = str(row.get("source_post_id") or row.get("post_id") or "").strip()
+        metrics_payload = dict(row.get("metrics_json") or {})
         return {
             "platform": str(row.get("platform") or "bluesky"),
+            "source_post_id": source_post_id,
+            "source_uri": str(row.get("source_uri") or source_post_id).strip() or None,
+            "source_cid": str(row.get("source_cid") or raw_json_payload.get("cid") or "").strip() or None,
+            "author_did": str(
+                row.get("author_did")
+                or row.get("author_id")
+                or raw_json_payload.get("authorDid")
+                or ""
+            ).strip()
+            or None,
             "post_id": str(row.get("post_id") or "").strip(),
             "author_id": str(row.get("author_id") or "").strip() or None,
             "author_handle": str(row.get("author_handle") or "").strip() or None,
             "root_post_id": str(row.get("root_post_id") or "").strip() or None,
             "reply_parent_id": str(row.get("reply_parent_id") or "").strip() or None,
             "created_at": created_at,
+            "inserted_at": ingested_at,
             "ingested_at": ingested_at,
+            "raw_text": str(row.get("raw_text") or row.get("text_content") or "").strip() or None,
             "text_content": str(row.get("text_content") or "").strip() or None,
             "language": str(row.get("language") or "").strip() or None,
             "urls": self._adapt_collection("raw_posts", "urls", row.get("urls")),
             "hashtags": self._adapt_collection("raw_posts", "hashtags", row.get("hashtags")),
-            "metrics_json": self._adapt_json("raw_posts", "metrics_json", row.get("metrics_json") or {}),
-            "raw_json": self._adapt_json("raw_posts", "raw_json", row.get("raw_json") or {}),
+            "like_count": int(
+                row.get("like_count")
+                or metrics_payload.get("likeCount")
+                or 0
+            ),
+            "repost_count": int(
+                row.get("repost_count")
+                or metrics_payload.get("repostCount")
+                or 0
+            ),
+            "reply_count": int(
+                row.get("reply_count")
+                or metrics_payload.get("replyCount")
+                or 0
+            ),
+            "reply_to_uri": str(row.get("reply_to_uri") or row.get("reply_parent_id") or "").strip() or None,
+            "repost_of_uri": str(
+                row.get("repost_of_uri")
+                or row.get("root_post_id")
+                or raw_json_payload.get("quotedUri")
+                or ""
+            ).strip()
+            or None,
+            "processed": bool(row.get("processed", False)),
+            "metrics_json": self._adapt_json("raw_posts", "metrics_json", metrics_payload),
+            "raw_json": self._adapt_json("raw_posts", "raw_json", raw_json_payload),
         }
 
     def _prepare_author_row(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -677,7 +1132,7 @@ class PostgresStore:
                 """
                 SELECT table_name, column_name, data_type, udt_name
                 FROM information_schema.columns
-                WHERE table_schema = current_schema()
+                WHERE table_schema = 'public'
                   AND table_name = ANY(%s)
                 """,
                 (

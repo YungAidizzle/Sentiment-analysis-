@@ -139,9 +139,14 @@ def main() -> int:
     if args.aggregate_1m or args.aggregate_1h:
         try:
             store.ensure_metric_bucket_tables()
+            store.ensure_processed_topic_tables()
             rows_1m = 0
             rows_1h = 0
+            processed_rows = 0
+            topic_rows_1m = 0
             if args.aggregate_1m:
+                processed_rows = store.refresh_processed_posts_from_raw_posts()
+                topic_rows_1m = store.aggregate_topic_buckets_1m_from_processed_posts()
                 rows_1m = store.aggregate_metric_buckets_1m()
                 log_event(
                     logger,
@@ -149,6 +154,8 @@ def main() -> int:
                     "aggregation_complete_1m",
                     source=source,
                     rows_affected=rows_1m,
+                    processed_rows_affected=processed_rows,
+                    topic_rows_affected=topic_rows_1m,
                 )
             if args.aggregate_1h:
                 rows_1h = store.aggregate_metric_buckets_1h()
@@ -168,6 +175,8 @@ def main() -> int:
                 aggregate_1h=args.aggregate_1h,
                 rows_1m=rows_1m,
                 rows_1h=rows_1h,
+                processed_rows=processed_rows,
+                topic_rows_1m=topic_rows_1m,
             )
             store.close()
             return 0

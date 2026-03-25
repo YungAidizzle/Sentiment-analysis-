@@ -64,7 +64,7 @@ class FakeCursor:
             self._fetchall = []
             self.rowcount = 1
             return
-        if "select notes" in normalized and "from ingestion_runs" in normalized:
+        if "select notes" in normalized and "from public.ingestion_runs" in normalized:
             self._fetchone = (json.dumps({"last_cursor_us": 987654321}),)
             self._fetchall = []
             self.rowcount = 1
@@ -171,7 +171,8 @@ class WorkerDbTests(unittest.TestCase):
         self.assertEqual(inserted, 1)
         self.assertEqual(len(fake_connection.executemany_calls), 1)
         query, _payload = fake_connection.executemany_calls[0]
-        self.assertIn("ON CONFLICT (platform, post_id) DO NOTHING", query)
+        self.assertIn("INSERT INTO public.raw_posts", query)
+        self.assertIn("ON CONFLICT (platform, source_post_id) DO UPDATE", query)
 
     @patch("backend.db.psycopg.connect")
     def test_upsert_authors_uses_conflict_upsert(self, connect_mock):
@@ -200,6 +201,7 @@ class WorkerDbTests(unittest.TestCase):
         self.assertEqual(affected, 1)
         self.assertEqual(len(fake_connection.executemany_calls), 1)
         query, _payload = fake_connection.executemany_calls[0]
+        self.assertIn("INSERT INTO public.authors", query)
         self.assertIn("ON CONFLICT (platform, author_id) DO UPDATE", query)
 
     @patch("backend.db.psycopg.connect")
@@ -214,8 +216,8 @@ class WorkerDbTests(unittest.TestCase):
         store.ensure_metric_bucket_tables()
 
         queries = [str(query) for query, _params in fake_connection.execute_calls]
-        self.assertTrue(any("CREATE TABLE IF NOT EXISTS metric_buckets_1m" in query for query in queries))
-        self.assertTrue(any("CREATE TABLE IF NOT EXISTS metric_buckets_1h" in query for query in queries))
+        self.assertTrue(any("CREATE TABLE IF NOT EXISTS public.metric_buckets_1m" in query for query in queries))
+        self.assertTrue(any("CREATE TABLE IF NOT EXISTS public.metric_buckets_1h" in query for query in queries))
 
     @patch("backend.db.psycopg.connect")
     def test_aggregate_metric_buckets_1m_uses_upsert(self, connect_mock):
@@ -230,9 +232,10 @@ class WorkerDbTests(unittest.TestCase):
 
         self.assertGreaterEqual(affected, 1)
         queries = [str(query) for query, _params in fake_connection.execute_calls]
-        aggregate_query = next(query for query in queries if "INSERT INTO metric_buckets_1m" in query)
+        aggregate_query = next(query for query in queries if "INSERT INTO public.metric_buckets_1m" in query)
         self.assertIn("date_trunc('minute', created_at)", aggregate_query)
-        self.assertIn("ON CONFLICT (bucket_start, platform) DO UPDATE", aggregate_query)
+        self.assertIn("FROM public.raw_posts", aggregate_query)
+        self.assertIn("ON CONFLICT (bucket_minute, platform) DO UPDATE", aggregate_query)
 
     @patch("backend.db.psycopg.connect")
     def test_aggregate_metric_buckets_1h_uses_upsert(self, connect_mock):
@@ -247,9 +250,44 @@ class WorkerDbTests(unittest.TestCase):
 
         self.assertGreaterEqual(affected, 1)
         queries = [str(query) for query, _params in fake_connection.execute_calls]
-        aggregate_query = next(query for query in queries if "INSERT INTO metric_buckets_1h" in query)
+        aggregate_query = next(query for query in queries if "INSERT INTO public.metric_buckets_1h" in query)
         self.assertIn("date_trunc('hour', created_at)", aggregate_query)
+        self.assertIn("FROM public.raw_posts", aggregate_query)
         self.assertIn("ON CONFLICT (bucket_start, platform) DO UPDATE", aggregate_query)
+
+    @patch("backend.db.psycopg.connect")
+    def test_refresh_processed_posts_reads_public_raw_posts(self, connect_mock):
+        fake_connection = FakeConnection()
+        connect_mock.return_value = fake_connection
+        store = PostgresStore(
+            database_url="postgresql://example",
+            batch_size=50,
+        )
+
+        affected = store.refresh_processed_posts_from_raw_posts()
+
+        self.assertGreaterEqual(affected, 1)
+        queries = [str(query) for query, _params in fake_connection.execute_calls]
+        refresh_query = next(query for query in queries if "INSERT INTO public.processed_posts" in query)
+        self.assertIn("FROM public.raw_posts", refresh_query)
+        self.assertTrue(any("TRUNCATE TABLE public.processed_posts" in query for query in queries))
+
+    @patch("backend.db.psycopg.connect")
+    def test_aggregate_topic_buckets_1m_reads_processed_posts(self, connect_mock):
+        fake_connection = FakeConnection()
+        connect_mock.return_value = fake_connection
+        store = PostgresStore(
+            database_url="postgresql://example",
+            batch_size=50,
+        )
+
+        affected = store.aggregate_topic_buckets_1m_from_processed_posts()
+
+        self.assertGreaterEqual(affected, 1)
+        queries = [str(query) for query, _params in fake_connection.execute_calls]
+        aggregate_query = next(query for query in queries if "INSERT INTO public.topic_buckets_1m" in query)
+        self.assertIn("FROM public.processed_posts", aggregate_query)
+        self.assertTrue(any("TRUNCATE TABLE public.topic_buckets_1m" in query for query in queries))
 
 
 if __name__ == "__main__":
