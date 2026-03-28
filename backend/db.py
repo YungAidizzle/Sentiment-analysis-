@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import psycopg
@@ -279,7 +279,7 @@ class PostgresStore:
                             reply_count = COALESCE(EXCLUDED.reply_count, public.raw_posts.reply_count),
                             reply_to_uri = COALESCE(EXCLUDED.reply_to_uri, public.raw_posts.reply_to_uri),
                             repost_of_uri = COALESCE(EXCLUDED.repost_of_uri, public.raw_posts.repost_of_uri),
-                            processed = COALESCE(EXCLUDED.processed, public.raw_posts.processed),
+                            processed = (public.raw_posts.processed OR COALESCE(EXCLUDED.processed, false)),
                             metrics_json = COALESCE(EXCLUDED.metrics_json, public.raw_posts.metrics_json),
                             raw_json = COALESCE(EXCLUDED.raw_json, public.raw_posts.raw_json),
                             post_id = COALESCE(EXCLUDED.post_id, public.raw_posts.post_id)
@@ -291,6 +291,276 @@ class PostgresStore:
             return inserted_total
 
         return self._execute_write("upsert_raw_posts", operation)
+
+    def ingest_raw_post(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        payload = self._prepare_raw_post_row(row)
+        if not payload.get("post_id"):
+            return None
+
+        def operation(connection: psycopg.Connection[Any]) -> dict[str, Any] | None:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO public.raw_posts (
+                        platform,
+                        source_post_id,
+                        source_uri,
+                        source_cid,
+                        author_did,
+                        post_id,
+                        author_id,
+                        author_handle,
+                        root_post_id,
+                        reply_parent_id,
+                        created_at,
+                        inserted_at,
+                        ingested_at,
+                        raw_text,
+                        text_content,
+                        language,
+                        urls,
+                        hashtags,
+                        like_count,
+                        repost_count,
+                        reply_count,
+                        reply_to_uri,
+                        repost_of_uri,
+                        processed,
+                        metrics_json,
+                        raw_json
+                    ) VALUES (
+                        %(platform)s,
+                        %(source_post_id)s,
+                        %(source_uri)s,
+                        %(source_cid)s,
+                        %(author_did)s,
+                        %(post_id)s,
+                        %(author_id)s,
+                        %(author_handle)s,
+                        %(root_post_id)s,
+                        %(reply_parent_id)s,
+                        %(created_at)s,
+                        %(inserted_at)s,
+                        %(ingested_at)s,
+                        %(raw_text)s,
+                        %(text_content)s,
+                        %(language)s,
+                        %(urls)s,
+                        %(hashtags)s,
+                        %(like_count)s,
+                        %(repost_count)s,
+                        %(reply_count)s,
+                        %(reply_to_uri)s,
+                        %(repost_of_uri)s,
+                        %(processed)s,
+                        %(metrics_json)s,
+                        %(raw_json)s
+                    )
+                    ON CONFLICT (platform, source_post_id) DO UPDATE
+                    SET source_uri = COALESCE(EXCLUDED.source_uri, public.raw_posts.source_uri),
+                        source_cid = COALESCE(EXCLUDED.source_cid, public.raw_posts.source_cid),
+                        author_did = COALESCE(EXCLUDED.author_did, public.raw_posts.author_did),
+                        author_id = COALESCE(EXCLUDED.author_id, public.raw_posts.author_id),
+                        author_handle = COALESCE(EXCLUDED.author_handle, public.raw_posts.author_handle),
+                        root_post_id = COALESCE(EXCLUDED.root_post_id, public.raw_posts.root_post_id),
+                        reply_parent_id = COALESCE(EXCLUDED.reply_parent_id, public.raw_posts.reply_parent_id),
+                        created_at = COALESCE(EXCLUDED.created_at, public.raw_posts.created_at),
+                        ingested_at = COALESCE(EXCLUDED.ingested_at, public.raw_posts.ingested_at),
+                        inserted_at = COALESCE(EXCLUDED.inserted_at, public.raw_posts.inserted_at),
+                        raw_text = COALESCE(EXCLUDED.raw_text, public.raw_posts.raw_text),
+                        text_content = COALESCE(EXCLUDED.text_content, public.raw_posts.text_content),
+                        language = COALESCE(EXCLUDED.language, public.raw_posts.language),
+                        urls = COALESCE(EXCLUDED.urls, public.raw_posts.urls),
+                        hashtags = COALESCE(EXCLUDED.hashtags, public.raw_posts.hashtags),
+                        like_count = COALESCE(EXCLUDED.like_count, public.raw_posts.like_count),
+                        repost_count = COALESCE(EXCLUDED.repost_count, public.raw_posts.repost_count),
+                        reply_count = COALESCE(EXCLUDED.reply_count, public.raw_posts.reply_count),
+                        reply_to_uri = COALESCE(EXCLUDED.reply_to_uri, public.raw_posts.reply_to_uri),
+                        repost_of_uri = COALESCE(EXCLUDED.repost_of_uri, public.raw_posts.repost_of_uri),
+                        processed = (public.raw_posts.processed OR COALESCE(EXCLUDED.processed, false)),
+                        metrics_json = COALESCE(EXCLUDED.metrics_json, public.raw_posts.metrics_json),
+                        raw_json = COALESCE(EXCLUDED.raw_json, public.raw_posts.raw_json),
+                        post_id = COALESCE(EXCLUDED.post_id, public.raw_posts.post_id)
+                    RETURNING
+                        id,
+                        platform,
+                        source_post_id,
+                        post_id,
+                        author_id,
+                        author_handle,
+                        root_post_id,
+                        reply_parent_id,
+                        created_at,
+                        inserted_at,
+                        ingested_at,
+                        raw_text,
+                        text_content,
+                        language,
+                        urls,
+                        hashtags,
+                        reply_to_uri,
+                        repost_of_uri,
+                        metrics_json,
+                        raw_json
+                    """,
+                    payload,
+                )
+                row_result = cursor.fetchone()
+                if not row_result:
+                    return None
+                return self._decode_ingested_raw_post_row(row_result)
+
+        return self._execute_write("ingest_raw_post", operation)
+
+    def upsert_processed_post(self, row: dict[str, Any]) -> int:
+        payload = self._prepare_processed_post_row(row)
+        raw_post_id = payload.get("raw_post_id")
+        if raw_post_id in {None, 0}:
+            return 0
+        source_post_id = str(payload.get("source_post_id") or "").strip()
+        if not source_post_id:
+            return 0
+
+        def operation(connection: psycopg.Connection[Any]) -> int:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO public.processed_posts (
+                        raw_post_id,
+                        platform,
+                        source_post_id,
+                        post_id,
+                        author_id,
+                        source_created_at,
+                        created_at,
+                        processed_at,
+                        bucket_minute,
+                        clean_text,
+                        normalized_text,
+                        language,
+                        has_media,
+                        is_reply,
+                        is_repost,
+                        is_quote,
+                        author_hash,
+                        token_count,
+                        fingerprint,
+                        tokens,
+                        hashtags,
+                        cashtags,
+                        mentions,
+                        domains,
+                        urls,
+                        key_phrases,
+                        topic_seeds,
+                        topic_key_candidate,
+                        tags,
+                        spam_score,
+                        quality_score,
+                        topic
+                    ) VALUES (
+                        %(raw_post_id)s,
+                        %(platform)s,
+                        %(source_post_id)s,
+                        %(post_id)s,
+                        %(author_id)s,
+                        %(source_created_at)s,
+                        %(created_at)s,
+                        %(processed_at)s,
+                        %(bucket_minute)s,
+                        %(clean_text)s,
+                        %(normalized_text)s,
+                        %(language)s,
+                        %(has_media)s,
+                        %(is_reply)s,
+                        %(is_repost)s,
+                        %(is_quote)s,
+                        %(author_hash)s,
+                        %(token_count)s,
+                        %(fingerprint)s,
+                        %(tokens)s,
+                        %(hashtags)s,
+                        %(cashtags)s,
+                        %(mentions)s,
+                        %(domains)s,
+                        %(urls)s,
+                        %(key_phrases)s,
+                        %(topic_seeds)s,
+                        %(topic_key_candidate)s,
+                        %(tags)s,
+                        %(spam_score)s,
+                        %(quality_score)s,
+                        %(topic)s
+                    )
+                    ON CONFLICT (raw_post_id) DO UPDATE
+                    SET platform = EXCLUDED.platform,
+                        source_post_id = EXCLUDED.source_post_id,
+                        post_id = EXCLUDED.post_id,
+                        author_id = EXCLUDED.author_id,
+                        source_created_at = COALESCE(EXCLUDED.source_created_at, public.processed_posts.source_created_at),
+                        created_at = COALESCE(EXCLUDED.created_at, public.processed_posts.created_at),
+                        processed_at = COALESCE(EXCLUDED.processed_at, public.processed_posts.processed_at),
+                        bucket_minute = COALESCE(EXCLUDED.bucket_minute, public.processed_posts.bucket_minute),
+                        clean_text = COALESCE(EXCLUDED.clean_text, public.processed_posts.clean_text),
+                        normalized_text = COALESCE(EXCLUDED.normalized_text, public.processed_posts.normalized_text),
+                        language = COALESCE(EXCLUDED.language, public.processed_posts.language),
+                        has_media = COALESCE(EXCLUDED.has_media, public.processed_posts.has_media),
+                        is_reply = COALESCE(EXCLUDED.is_reply, public.processed_posts.is_reply),
+                        is_repost = COALESCE(EXCLUDED.is_repost, public.processed_posts.is_repost),
+                        is_quote = COALESCE(EXCLUDED.is_quote, public.processed_posts.is_quote),
+                        author_hash = COALESCE(EXCLUDED.author_hash, public.processed_posts.author_hash),
+                        token_count = COALESCE(EXCLUDED.token_count, public.processed_posts.token_count),
+                        fingerprint = COALESCE(EXCLUDED.fingerprint, public.processed_posts.fingerprint),
+                        tokens = COALESCE(EXCLUDED.tokens, public.processed_posts.tokens),
+                        hashtags = COALESCE(EXCLUDED.hashtags, public.processed_posts.hashtags),
+                        cashtags = COALESCE(EXCLUDED.cashtags, public.processed_posts.cashtags),
+                        mentions = COALESCE(EXCLUDED.mentions, public.processed_posts.mentions),
+                        domains = COALESCE(EXCLUDED.domains, public.processed_posts.domains),
+                        urls = COALESCE(EXCLUDED.urls, public.processed_posts.urls),
+                        key_phrases = COALESCE(EXCLUDED.key_phrases, public.processed_posts.key_phrases),
+                        topic_seeds = COALESCE(EXCLUDED.topic_seeds, public.processed_posts.topic_seeds),
+                        topic_key_candidate = COALESCE(EXCLUDED.topic_key_candidate, public.processed_posts.topic_key_candidate),
+                        tags = COALESCE(EXCLUDED.tags, public.processed_posts.tags),
+                        spam_score = COALESCE(EXCLUDED.spam_score, public.processed_posts.spam_score),
+                        quality_score = COALESCE(EXCLUDED.quality_score, public.processed_posts.quality_score),
+                        topic = COALESCE(EXCLUDED.topic, public.processed_posts.topic)
+                    """,
+                    payload,
+                )
+                processed_row_count = int(cursor.rowcount or 0)
+                cursor.execute(
+                    """
+                    UPDATE public.raw_posts
+                    SET processed = TRUE
+                    WHERE id = %s
+                    """,
+                    (raw_post_id,),
+                )
+                return processed_row_count
+
+        return self._execute_write("upsert_processed_post", operation)
+
+    def prune_raw_posts_older_than(self, *, hours: float) -> int:
+        retention_hours = max(0.0, float(hours))
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=retention_hours)
+
+        def operation(connection: psycopg.Connection[Any]) -> int:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    WITH deleted AS (
+                        DELETE FROM public.raw_posts
+                        WHERE COALESCE(ingested_at, inserted_at, created_at, now()) < %s
+                        RETURNING id
+                    )
+                    SELECT COUNT(*)::BIGINT FROM deleted
+                    """,
+                    (cutoff,),
+                )
+                row = cursor.fetchone()
+                return int((row or [0])[0] or 0)
+
+        return self._execute_write("prune_raw_posts_older_than", operation)
 
     def upsert_authors(self, rows: Iterable[dict[str, Any]]) -> int:
         payload = [self._prepare_author_row(row) for row in rows]
@@ -355,6 +625,7 @@ class PostgresStore:
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS public.raw_posts (
+                    id BIGSERIAL PRIMARY KEY,
                     platform TEXT NOT NULL,
                     source_post_id TEXT,
                     source_uri TEXT,
@@ -384,6 +655,39 @@ class PostgresStore:
                 )
                 """
             )
+            cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS id BIGINT")
+            cursor.execute("CREATE SEQUENCE IF NOT EXISTS public.raw_posts_id_seq")
+            cursor.execute(
+                """
+                ALTER TABLE public.raw_posts
+                ALTER COLUMN id SET DEFAULT nextval('public.raw_posts_id_seq')
+                """
+            )
+            cursor.execute(
+                """
+                ALTER SEQUENCE public.raw_posts_id_seq
+                OWNED BY public.raw_posts.id
+                """
+            )
+            cursor.execute(
+                """
+                UPDATE public.raw_posts
+                SET id = nextval('public.raw_posts_id_seq')
+                WHERE id IS NULL
+                """
+            )
+            cursor.execute(
+                """
+                SELECT setval(
+                    'public.raw_posts_id_seq',
+                    GREATEST(
+                        COALESCE((SELECT MAX(id) FROM public.raw_posts), 0),
+                        1
+                    ),
+                    true
+                )
+                """
+            )
             cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS platform TEXT")
             cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS source_post_id TEXT")
             cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS source_uri TEXT")
@@ -410,6 +714,13 @@ class PostgresStore:
             cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS processed BOOLEAN")
             cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS metrics_json JSONB")
             cursor.execute("ALTER TABLE public.raw_posts ADD COLUMN IF NOT EXISTS raw_json JSONB")
+            cursor.execute("ALTER TABLE public.raw_posts ALTER COLUMN id SET NOT NULL")
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_posts_id
+                ON public.raw_posts (id)
+                """
+            )
 
             cursor.execute(
                 """
@@ -481,6 +792,12 @@ class PostgresStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_raw_posts_created_at
                 ON public.raw_posts (created_at)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_raw_posts_ingested_at
+                ON public.raw_posts (ingested_at)
                 """
             )
             cursor.execute(
@@ -746,15 +1063,23 @@ class PostgresStore:
                     """
                     CREATE TABLE IF NOT EXISTS public.processed_posts (
                         id BIGSERIAL PRIMARY KEY,
-                        raw_post_id BIGINT,
+                        raw_post_id BIGINT NOT NULL,
                         platform TEXT NOT NULL,
                         source_post_id TEXT NOT NULL,
+                        source_created_at TIMESTAMPTZ,
+                        post_id TEXT,
+                        author_id TEXT,
                         created_at TIMESTAMPTZ NOT NULL,
                         processed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                         bucket_minute TIMESTAMPTZ NOT NULL,
                         clean_text TEXT,
                         normalized_text TEXT,
                         language TEXT,
+                        quality_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        topic_key_candidate TEXT,
+                        tokens TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        mentions TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        tags TEXT[] NOT NULL DEFAULT '{}'::text[],
                         has_media BOOLEAN NOT NULL DEFAULT false,
                         is_reply BOOLEAN NOT NULL DEFAULT false,
                         is_repost BOOLEAN NOT NULL DEFAULT false,
@@ -769,9 +1094,6 @@ class PostgresStore:
                         key_phrases TEXT[] NOT NULL DEFAULT '{}'::text[],
                         topic_seeds TEXT[] NOT NULL DEFAULT '{}'::text[],
                         spam_score NUMERIC NOT NULL DEFAULT 0,
-                        quality_score NUMERIC NOT NULL DEFAULT 0,
-                        post_id TEXT,
-                        author_id TEXT,
                         topic TEXT
                     )
                     """
@@ -779,12 +1101,20 @@ class PostgresStore:
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS raw_post_id BIGINT")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS platform TEXT")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS source_post_id TEXT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS source_created_at TIMESTAMPTZ")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS post_id TEXT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS author_id TEXT")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS bucket_minute TIMESTAMPTZ")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS clean_text TEXT")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS normalized_text TEXT")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS language TEXT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS quality_score DOUBLE PRECISION")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS topic_key_candidate TEXT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS tokens TEXT[]")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS mentions TEXT[]")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS tags TEXT[]")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS has_media BOOLEAN")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS is_reply BOOLEAN")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS is_repost BOOLEAN")
@@ -799,10 +1129,24 @@ class PostgresStore:
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS key_phrases TEXT[]")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS topic_seeds TEXT[]")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS spam_score NUMERIC")
-                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS quality_score NUMERIC")
-                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS post_id TEXT")
-                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS author_id TEXT")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS topic TEXT")
+                cursor.execute(
+                    """
+                    UPDATE public.processed_posts
+                    SET processed_at = now()
+                    WHERE processed_at IS NULL
+                    """
+                )
+                cursor.execute(
+                    """
+                    UPDATE public.processed_posts
+                    SET bucket_minute = date_trunc(
+                        'minute',
+                        COALESCE(source_created_at, created_at, processed_at, now())
+                    )
+                    WHERE bucket_minute IS NULL
+                    """
+                )
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS public.topic_buckets_1m (
@@ -846,6 +1190,33 @@ class PostgresStore:
                 )
                 cursor.execute(
                     """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_processed_posts_raw_post_id
+                    ON public.processed_posts (raw_post_id)
+                    """
+                )
+                cursor.execute(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1
+                            FROM pg_constraint
+                            WHERE conrelid = 'public.processed_posts'::regclass
+                              AND confrelid = 'public.raw_posts'::regclass
+                              AND contype = 'f'
+                        ) THEN
+                            ALTER TABLE public.processed_posts
+                            ADD CONSTRAINT processed_posts_raw_post_id_fkey
+                            FOREIGN KEY (raw_post_id)
+                            REFERENCES public.raw_posts(id)
+                            ON DELETE CASCADE;
+                        END IF;
+                    END;
+                    $$;
+                    """
+                )
+                cursor.execute(
+                    """
                     CREATE UNIQUE INDEX IF NOT EXISTS uq_processed_posts_platform_source_post_id
                     ON public.processed_posts (platform, source_post_id)
                     """
@@ -858,8 +1229,33 @@ class PostgresStore:
                 )
                 cursor.execute(
                     """
+                    CREATE INDEX IF NOT EXISTS idx_processed_posts_bucket_minute
+                    ON public.processed_posts (bucket_minute)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_processed_posts_platform_bucket_minute
+                    ON public.processed_posts (platform, bucket_minute)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_processed_posts_topic_key_candidate
+                    ON public.processed_posts (topic_key_candidate)
+                    """
+                )
+                cursor.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS idx_processed_posts_topic
                     ON public.processed_posts (platform, source_post_id, created_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_processed_posts_tags_gin
+                    ON public.processed_posts
+                    USING GIN (tags)
                     """
                 )
                 cursor.execute(
@@ -868,6 +1264,8 @@ class PostgresStore:
                     ON public.topic_buckets_1m (platform, topic_key, bucket_minute DESC)
                     """
                 )
+
+            self._load_column_metadata()
 
         self._execute_write("ensure_processed_topic_tables", operation)
 
@@ -878,22 +1276,29 @@ class PostgresStore:
                 cursor.execute(
                     """
                     INSERT INTO public.processed_posts (
+                        raw_post_id,
                         platform,
                         source_post_id,
                         post_id,
                         author_id,
+                        source_created_at,
                         created_at,
                         processed_at,
                         bucket_minute,
                         clean_text,
                         normalized_text,
                         language,
+                        quality_score,
+                        topic_key_candidate,
+                        tokens,
                         has_media,
                         is_reply,
                         is_repost,
                         is_quote,
                         author_hash,
                         token_count,
+                        mentions,
+                        tags,
                         hashtags,
                         cashtags,
                         domains,
@@ -901,33 +1306,38 @@ class PostgresStore:
                         key_phrases,
                         topic_seeds,
                         spam_score,
-                        quality_score,
                         topic
                     )
                     SELECT
+                        rp.id,
                         rp.platform,
                         COALESCE(rp.source_post_id, rp.post_id),
                         rp.post_id,
                         rp.author_id,
+                        rp.created_at,
                         rp.created_at,
                         COALESCE(rp.ingested_at, rp.inserted_at, now()),
                         date_trunc('minute', rp.created_at),
                         COALESCE(rp.raw_text, rp.text_content),
                         COALESCE(rp.raw_text, rp.text_content),
                         rp.language,
+                        0::double precision,
+                        'general'::text,
+                        '{}'::text[],
                         false,
                         (rp.reply_parent_id IS NOT NULL),
                         (rp.repost_of_uri IS NOT NULL),
                         false,
                         NULL::text,
                         0,
+                        '{}'::text[],
+                        ARRAY['general']::text[],
                         COALESCE(rp.hashtags, '{}'::text[]),
                         '{}'::text[],
                         '{}'::text[],
                         COALESCE(rp.urls, '{}'::text[]),
                         '{}'::text[],
                         '{}'::text[],
-                        0::numeric,
                         0::numeric,
                         'all'::text AS topic
                     FROM public.raw_posts rp
@@ -1051,6 +1461,99 @@ class PostgresStore:
             "raw_json": self._adapt_json("raw_posts", "raw_json", raw_json_payload),
         }
 
+    @staticmethod
+    def _decode_ingested_raw_post_row(row: Sequence[Any]) -> dict[str, Any]:
+        return {
+            "id": row[0],
+            "platform": row[1],
+            "source_post_id": row[2],
+            "post_id": row[3],
+            "author_id": row[4],
+            "author_handle": row[5],
+            "root_post_id": row[6],
+            "reply_parent_id": row[7],
+            "created_at": row[8],
+            "inserted_at": row[9],
+            "ingested_at": row[10],
+            "raw_text": row[11],
+            "text_content": row[12],
+            "language": row[13],
+            "urls": row[14],
+            "hashtags": row[15],
+            "reply_to_uri": row[16],
+            "repost_of_uri": row[17],
+            "metrics_json": row[18] or {},
+            "raw_json": row[19] or {},
+        }
+
+    def _prepare_processed_post_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        processed_at = row.get("processed_at") or datetime.now(timezone.utc)
+        source_created_at = row.get("source_created_at") or row.get("created_at")
+        if source_created_at is None:
+            source_created_at = processed_at
+        created_at = row.get("created_at") or source_created_at
+        if created_at is None:
+            created_at = processed_at
+        bucket_minute = row.get("bucket_minute")
+        if bucket_minute is None and created_at is not None:
+            try:
+                bucket_minute = created_at.replace(second=0, microsecond=0)
+            except Exception:
+                bucket_minute = processed_at.replace(second=0, microsecond=0)
+        if bucket_minute is None:
+            bucket_minute = processed_at.replace(second=0, microsecond=0)
+
+        quality_score = row.get("quality_score")
+        try:
+            quality_score_value = float(quality_score if quality_score is not None else 0.0)
+        except (TypeError, ValueError):
+            quality_score_value = 0.0
+
+        spam_score = row.get("spam_score")
+        try:
+            spam_score_value = float(spam_score if spam_score is not None else 0.0)
+        except (TypeError, ValueError):
+            spam_score_value = 0.0
+
+        topic_key_candidate = str(row.get("topic_key_candidate") or row.get("topic") or "general").strip()
+        if not topic_key_candidate:
+            topic_key_candidate = "general"
+
+        return {
+            "raw_post_id": row.get("raw_post_id"),
+            "platform": str(row.get("platform") or "bluesky").strip() or "bluesky",
+            "source_post_id": str(row.get("source_post_id") or row.get("post_id") or "").strip(),
+            "post_id": str(row.get("post_id") or "").strip() or None,
+            "author_id": str(row.get("author_id") or "").strip() or None,
+            "source_created_at": source_created_at,
+            "created_at": created_at,
+            "processed_at": processed_at,
+            "bucket_minute": bucket_minute,
+            "clean_text": str(row.get("clean_text") or "").strip() or None,
+            "normalized_text": str(row.get("normalized_text") or row.get("clean_text") or "").strip() or None,
+            "language": str(row.get("language") or "").strip() or None,
+            "quality_score": quality_score_value,
+            "topic_key_candidate": topic_key_candidate,
+            "tokens": self._adapt_collection("processed_posts", "tokens", row.get("tokens")),
+            "hashtags": self._adapt_collection("processed_posts", "hashtags", row.get("hashtags")),
+            "mentions": self._adapt_collection("processed_posts", "mentions", row.get("mentions")),
+            "urls": self._adapt_collection("processed_posts", "urls", row.get("urls")),
+            "domains": self._adapt_collection("processed_posts", "domains", row.get("domains")),
+            "tags": self._adapt_collection("processed_posts", "tags", row.get("tags")),
+            "has_media": bool(row.get("has_media", False)),
+            "is_reply": bool(row.get("is_reply", False)),
+            "is_repost": bool(row.get("is_repost", False)),
+            "is_quote": bool(row.get("is_quote", False)),
+            "author_hash": str(row.get("author_hash") or "").strip() or None,
+            "token_count": int(row.get("token_count", 0) or 0),
+            "fingerprint": str(row.get("fingerprint") or "").strip() or None,
+            "cashtags": self._adapt_collection("processed_posts", "cashtags", row.get("cashtags")),
+            "key_phrases": self._adapt_collection("processed_posts", "key_phrases", row.get("key_phrases")),
+            "topic_seeds": self._adapt_collection("processed_posts", "topic_seeds", row.get("topic_seeds")),
+            "spam_score": spam_score_value,
+            "topic": str(row.get("topic") or topic_key_candidate).strip() or topic_key_candidate,
+        }
+
     def _prepare_author_row(self, row: dict[str, Any]) -> dict[str, Any]:
         observed_at = datetime.now(timezone.utc)
         first_seen = row.get("first_seen_at") or observed_at
@@ -1140,6 +1643,7 @@ class PostgresStore:
                         "raw_posts",
                         "authors",
                         "ingestion_runs",
+                        "processed_posts",
                     ],
                 ),
             )
@@ -1155,7 +1659,9 @@ class PostgresStore:
 
         required_columns = {
             "raw_posts": {
+                "id",
                 "platform",
+                "source_post_id",
                 "post_id",
                 "author_id",
                 "author_handle",
