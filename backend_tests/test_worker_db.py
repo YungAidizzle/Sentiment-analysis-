@@ -41,6 +41,11 @@ SCHEMA_ROWS = [
     ("processed_posts", "urls", "ARRAY", "_text"),
     ("processed_posts", "domains", "ARRAY", "_text"),
     ("processed_posts", "tags", "ARRAY", "_text"),
+    ("processed_posts", "topic_entities", "ARRAY", "_text"),
+    ("processed_posts", "sentiment_label", "text", "text"),
+    ("processed_posts", "sentiment_positive_score", "integer", "int4"),
+    ("processed_posts", "sentiment_negative_score", "integer", "int4"),
+    ("processed_posts", "sentiment_neutral_score", "integer", "int4"),
     ("processed_posts", "cashtags", "ARRAY", "_text"),
     ("processed_posts", "key_phrases", "ARRAY", "_text"),
     ("processed_posts", "topic_seeds", "ARRAY", "_text"),
@@ -55,6 +60,18 @@ SCHEMA_ROWS = [
     ("processed_posts", "topic", "text", "text"),
     ("processed_posts", "post_id", "text", "text"),
     ("processed_posts", "author_id", "text", "text"),
+    ("post_topics", "id", "bigint", "int8"),
+    ("post_topics", "raw_post_id", "bigint", "int8"),
+    ("post_topics", "processed_post_id", "bigint", "int8"),
+    ("post_topics", "platform", "text", "text"),
+    ("post_topics", "source_post_id", "text", "text"),
+    ("post_topics", "topic_text", "text", "text"),
+    ("post_topics", "normalized_topic", "text", "text"),
+    ("post_topics", "topic_type", "text", "text"),
+    ("post_topics", "language", "text", "text"),
+    ("post_topics", "source_created_at", "timestamp with time zone", "timestamptz"),
+    ("post_topics", "bucket_minute", "timestamp with time zone", "timestamptz"),
+    ("post_topics", "created_at", "timestamp with time zone", "timestamptz"),
     ("authors", "platform", "text", "text"),
     ("authors", "author_id", "text", "text"),
     ("authors", "author_handle", "text", "text"),
@@ -133,6 +150,15 @@ class FakeCursor:
             self._fetchone = (5,)
             self._fetchall = []
             self.rowcount = 5
+            return
+        if "insert into public.processed_posts" in normalized and "returning id, raw_post_id, processed_at" in normalized:
+            self._fetchone = (
+                501,
+                42,
+                datetime(2026, 3, 25, 10, 0, tzinfo=timezone.utc),
+            )
+            self._fetchall = []
+            self.rowcount = 1
             return
         self.rowcount = 1
         self._fetchall = []
@@ -335,6 +361,11 @@ class WorkerDbTests(unittest.TestCase):
                 "urls": ["https://example.com"],
                 "domains": ["example.com"],
                 "tags": ["general"],
+                "topic_entities": ["AI", "Bluesky"],
+                "sentiment_label": "positive",
+                "sentiment_positive_score": 2,
+                "sentiment_negative_score": 0,
+                "sentiment_neutral_score": 1,
                 "topic": "ai",
             }
         )
@@ -344,6 +375,39 @@ class WorkerDbTests(unittest.TestCase):
         processed_query = next(query for query in queries if "INSERT INTO public.processed_posts" in query)
         self.assertIn("ON CONFLICT (raw_post_id) DO UPDATE", processed_query)
         self.assertTrue(any("UPDATE public.raw_posts" in query for query in queries))
+
+    @patch("backend.db.psycopg.connect")
+    def test_persist_post_topics_upserts_by_raw_topic_type(self, connect_mock):
+        fake_connection = FakeConnection()
+        connect_mock.return_value = fake_connection
+        store = PostgresStore(
+            database_url="postgresql://example",
+            batch_size=50,
+        )
+
+        affected = store.persist_post_topics(
+            [
+                {
+                    "raw_post_id": 42,
+                    "processed_post_id": 501,
+                    "platform": "bluesky",
+                    "source_post_id": "at://did:plc:abc/app.bsky.feed.post/xyz",
+                    "topic_text": "Polymarket",
+                    "normalized_topic": "Polymarket",
+                    "topic_type": "entity",
+                    "language": "en",
+                    "source_created_at": datetime(2026, 3, 25, 9, 30, tzinfo=timezone.utc),
+                    "bucket_minute": datetime(2026, 3, 25, 9, 30, tzinfo=timezone.utc),
+                    "created_at": datetime(2026, 3, 25, 10, 0, tzinfo=timezone.utc),
+                }
+            ]
+        )
+
+        self.assertEqual(affected, 1)
+        self.assertEqual(len(fake_connection.executemany_calls), 1)
+        query, _payload = fake_connection.executemany_calls[0]
+        self.assertIn("INSERT INTO public.post_topics", query)
+        self.assertIn("ON CONFLICT (raw_post_id, normalized_topic, topic_type) DO UPDATE", query)
 
     @patch("backend.db.psycopg.connect")
     def test_prune_raw_posts_deletes_rows_older_than_retention(self, connect_mock):

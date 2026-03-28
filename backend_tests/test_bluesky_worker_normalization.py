@@ -2,7 +2,9 @@ import unittest
 from datetime import datetime, timezone
 
 from backend.collectors.bluesky_worker import (
+    analyzeSentiment,
     extractFeatures,
+    extractTopicEntities,
     normalizeIncomingEvent,
     normalize_authors_for_authors_table,
     normalize_posts_for_raw_table,
@@ -96,6 +98,36 @@ class BlueskyWorkerNormalizationTests(unittest.TestCase):
         self.assertEqual(processed["topic_key_candidate"], processed["topic"])
         self.assertEqual(processed["mentions"], ["alice"])
         self.assertEqual(processed["domains"], ["example.com"])
+        self.assertIn("sentiment_label", processed)
+        self.assertIsInstance(processed["topic_entities"], list)
+
+    def test_extract_topic_entities_prefers_entity_like_terms(self):
+        raw_row = {
+            "text_content": (
+                "NYSE parent finalizes investment in Polymarket. "
+                "ICE has invested, and rival Kalshi recently raised capital."
+            )
+        }
+
+        topics = extractTopicEntities(raw_row)
+        normalized_topics = [row["normalized_topic"] for row in topics]
+
+        self.assertIn("NYSE", normalized_topics)
+        self.assertIn("Polymarket", normalized_topics)
+        self.assertIn("ICE", normalized_topics)
+        self.assertIn("Kalshi", normalized_topics)
+        self.assertNotIn("parent", [topic.lower() for topic in normalized_topics])
+
+    def test_analyze_sentiment_applies_weighted_lexicon(self):
+        sentiment = analyzeSentiment(
+            clean_text="I love this but hate the bad execution, still ok overall.",
+            language="en",
+        )
+
+        self.assertEqual(sentiment["sentiment_positive_score"], 3)
+        self.assertEqual(sentiment["sentiment_negative_score"], 4)
+        self.assertEqual(sentiment["sentiment_neutral_score"], 1)
+        self.assertEqual(sentiment["sentiment_label"], "negative")
 
     def test_normalize_authors_for_authors_table_merges_profile_and_post_rows(self):
         observed_at = datetime(2026, 3, 25, 10, 0, tzinfo=timezone.utc)
