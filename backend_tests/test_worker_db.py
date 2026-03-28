@@ -129,6 +129,11 @@ class FakeCursor:
             self._fetchall = []
             self.rowcount = 1
             return
+        if "with deleted as" in normalized and "delete from public.raw_posts" in normalized:
+            self._fetchone = (5,)
+            self._fetchall = []
+            self.rowcount = 5
+            return
         self.rowcount = 1
         self._fetchall = []
         self._fetchone = None
@@ -339,6 +344,22 @@ class WorkerDbTests(unittest.TestCase):
         processed_query = next(query for query in queries if "INSERT INTO public.processed_posts" in query)
         self.assertIn("ON CONFLICT (raw_post_id) DO UPDATE", processed_query)
         self.assertTrue(any("UPDATE public.raw_posts" in query for query in queries))
+
+    @patch("backend.db.psycopg.connect")
+    def test_prune_raw_posts_deletes_rows_older_than_retention(self, connect_mock):
+        fake_connection = FakeConnection()
+        connect_mock.return_value = fake_connection
+        store = PostgresStore(
+            database_url="postgresql://example",
+            batch_size=50,
+        )
+
+        deleted = store.prune_raw_posts_older_than(hours=1.0)
+
+        self.assertEqual(deleted, 5)
+        queries = [str(query) for query, _params in fake_connection.execute_calls]
+        prune_query = next(query for query in queries if "DELETE FROM public.raw_posts" in query)
+        self.assertIn("COALESCE(ingested_at, inserted_at, created_at, now())", prune_query)
 
     @patch("backend.db.psycopg.connect")
     def test_ensure_metric_bucket_tables_creates_required_tables(self, connect_mock):

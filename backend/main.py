@@ -217,6 +217,7 @@ def main() -> int:
     last_stats: dict[str, Any] = {}
     last_timings: dict[str, Any] = {}
     run_status = "running"
+    last_raw_cleanup_at_monotonic = 0.0
 
     stop_requested = False
 
@@ -229,6 +230,40 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_signal)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, handle_signal)
+
+    def run_raw_cleanup_if_due(*, force: bool = False) -> None:
+        nonlocal last_raw_cleanup_at_monotonic
+        if config.raw_retention_hours <= 0:
+            return
+
+        now_monotonic = time.monotonic()
+        due = force or (
+            last_raw_cleanup_at_monotonic <= 0
+            or (now_monotonic - last_raw_cleanup_at_monotonic) >= config.raw_cleanup_interval_seconds
+        )
+        if not due:
+            return
+
+        try:
+            deleted_count = store.prune_raw_posts_older_than(hours=config.raw_retention_hours)
+            if deleted_count > 0:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "raw_cleanup_complete",
+                    deleted_raw_posts=deleted_count,
+                    retention_hours=config.raw_retention_hours,
+                )
+        except Exception as cleanup_error:
+            log_event(
+                logger,
+                logging.ERROR,
+                "raw_cleanup_failed",
+                error=str(cleanup_error),
+                retention_hours=config.raw_retention_hours,
+            )
+        finally:
+            last_raw_cleanup_at_monotonic = now_monotonic
 
     initial_notes = _build_run_notes(
         cycle=cycle,
@@ -261,14 +296,19 @@ def main() -> int:
         resumed_cursor=cursor_us or 0,
         once=args.once,
         max_cycles=args.max_cycles,
+        raw_retention_hours=config.raw_retention_hours,
+        raw_cleanup_interval_seconds=config.raw_cleanup_interval_seconds,
     )
 
     try:
+        run_raw_cleanup_if_due(force=True)
         while not stop_requested:
             if args.max_cycles > 0 and cycle >= args.max_cycles:
                 run_status = "completed"
                 shutdown_reason = "max_cycles_reached"
                 break
+
+            run_raw_cleanup_if_due()
 
             cycle += 1
             cycle_started = time.monotonic()

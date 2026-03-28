@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import psycopg
@@ -540,6 +540,28 @@ class PostgresStore:
 
         return self._execute_write("upsert_processed_post", operation)
 
+    def prune_raw_posts_older_than(self, *, hours: float) -> int:
+        retention_hours = max(0.0, float(hours))
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=retention_hours)
+
+        def operation(connection: psycopg.Connection[Any]) -> int:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    WITH deleted AS (
+                        DELETE FROM public.raw_posts
+                        WHERE COALESCE(ingested_at, inserted_at, created_at, now()) < %s
+                        RETURNING id
+                    )
+                    SELECT COUNT(*)::BIGINT FROM deleted
+                    """,
+                    (cutoff,),
+                )
+                row = cursor.fetchone()
+                return int((row or [0])[0] or 0)
+
+        return self._execute_write("prune_raw_posts_older_than", operation)
+
     def upsert_authors(self, rows: Iterable[dict[str, Any]]) -> int:
         payload = [self._prepare_author_row(row) for row in rows]
         payload = [row for row in payload if row.get("author_id")]
@@ -770,6 +792,12 @@ class PostgresStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_raw_posts_created_at
                 ON public.raw_posts (created_at)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_raw_posts_ingested_at
+                ON public.raw_posts (ingested_at)
                 """
             )
             cursor.execute(
