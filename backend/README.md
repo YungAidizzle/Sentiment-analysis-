@@ -7,8 +7,8 @@ This worker runs independently from the frontend and continuously ingests Bluesk
 - Reuses `backend.bluesky_firehose.sync_bluesky_firehose` for Jetstream ingestion and normalization.
 - Runs one internal two-stage pipeline inside the same worker service:
   - `ingestRawPost(...)`: persist validated/normalized records into `raw_posts`.
-  - `processRawPost(...)`: derive reusable text features/tags and persist into `processed_posts`.
-- Writes normalized posts into `raw_posts` first, then writes derived rows into `processed_posts` with `raw_post_id`.
+  - `processRawPost(...)`: derive reusable text features/tags/topics/sentiment and persist into `processed_posts`.
+- Writes normalized posts into `raw_posts` first, then writes derived rows into `processed_posts` with `raw_post_id`, then fans out multi-topic mentions into `post_topics`.
 - Upserts author records into `authors`.
 - Tracks worker lifecycle in `ingestion_runs` (one row per process lifecycle).
 - Resumes from the last cursor stored in `ingestion_runs.notes`.
@@ -76,5 +76,8 @@ The worker is frontend-independent and can run continuously as a dedicated backg
 - `raw_post_id` (FK to `raw_posts.id`)
 - core identifiers: `platform`, `source_post_id`
 - text/features: `clean_text`, `language`, `tokens`, `hashtags`, `mentions`, `urls`, `domains`
-- lightweight routing fields: `topic_key_candidate`, `tags`
+- multi-topic fields: `topic_entities`, `topic_key_candidate`, `tags`
+- sentiment fields: `sentiment_label`, `sentiment_positive_score`, `sentiment_negative_score`, `sentiment_neutral_score`
 - timing fields: `source_created_at`, `processed_at`, `bucket_minute`
+
+`post_topics` stores one row per `(post, topic)` mention to support multi-topic trend aggregation.

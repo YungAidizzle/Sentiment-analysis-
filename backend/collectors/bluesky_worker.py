@@ -16,6 +16,43 @@ MENTION_PATTERN = re.compile(r"(?:^|\s)@([A-Za-z0-9_.-]{1,100})")
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_'-]{1,63}")
 CASHTAG_PATTERN = re.compile(r"\$([A-Za-z][A-Za-z0-9]{1,15})")
 WHITESPACE_PATTERN = re.compile(r"\s+")
+PHRASE_TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9&'-]*")
+
+TOPIC_CONNECTOR_WORDS = {
+    "&",
+    "and",
+    "at",
+    "for",
+    "in",
+    "of",
+    "on",
+    "the",
+    "to",
+}
+
+TOPIC_BLOCKLIST = {
+    "a",
+    "an",
+    "and",
+    "bad",
+    "bro",
+    "crazy",
+    "good",
+    "got",
+    "i",
+    "like",
+    "look",
+    "need",
+    "people",
+    "really",
+    "rival",
+    "that",
+    "thing",
+    "this",
+    "today",
+    "want",
+    "wild",
+}
 
 STOPWORD_TOKENS = {
     "a",
@@ -106,6 +143,42 @@ PRODUCT_TERMS = {
     "retail",
     "store",
     "trend",
+}
+
+POSITIVE_SENTIMENT_LEXICON = {
+    "awesome": 2,
+    "bullish": 2,
+    "excellent": 2,
+    "good": 1,
+    "great": 2,
+    "improve": 1,
+    "improved": 1,
+    "love": 3,
+    "positive": 1,
+    "strong": 1,
+    "upside": 1,
+    "win": 2,
+}
+
+NEGATIVE_SENTIMENT_LEXICON = {
+    "awful": 2,
+    "bad": 1,
+    "bearish": 2,
+    "crash": 2,
+    "dump": 2,
+    "fail": 2,
+    "hate": 3,
+    "loss": 2,
+    "negative": 1,
+    "risk": 1,
+    "scam": 2,
+    "weak": 1,
+}
+
+NEUTRAL_SENTIMENT_LEXICON = {
+    "fine": 1,
+    "ok": 1,
+    "okay": 1,
 }
 
 
@@ -234,6 +307,85 @@ def _extract_domains(urls: Iterable[str]) -> List[str]:
             continue
         domains.append(host)
     return _dedupe_text(domains)
+
+
+def _normalize_topic_text(value: str) -> str:
+    candidate = _normalize_whitespace(str(value or ""))
+    candidate = candidate.strip("`~!%^*()[]{}<>:;\",.?/\\|")
+    return candidate
+
+
+def _normalize_topic_value(value: str, *, topic_type: str) -> str:
+    candidate = _normalize_topic_text(value)
+    if not candidate:
+        return ""
+
+    if topic_type == "cashtag":
+        return candidate.removeprefix("$").upper()
+    if topic_type == "hashtag":
+        return candidate.removeprefix("#").lower()
+
+    words = candidate.split(" ")
+    normalized_words: list[str] = []
+    for word in words:
+        token = str(word or "").strip()
+        if not token:
+            continue
+        if token.lower() in TOPIC_CONNECTOR_WORDS:
+            normalized_words.append(token.lower())
+            continue
+        if token.isupper() and 2 <= len(token) <= 10:
+            normalized_words.append(token)
+            continue
+        if any(character.isdigit() for character in token):
+            normalized_words.append(token.upper() if token.isupper() else token)
+            continue
+        if "-" in token:
+            normalized_words.append("-".join(part[:1].upper() + part[1:].lower() for part in token.split("-") if part))
+            continue
+        normalized_words.append(token[:1].upper() + token[1:].lower())
+
+    normalized = " ".join(normalized_words).strip()
+    return normalized
+
+
+def _is_valid_topic_candidate(value: str, *, topic_type: str) -> bool:
+    candidate = _normalize_topic_text(value)
+    if not candidate:
+        return False
+
+    normalized = _normalize_topic_value(candidate, topic_type=topic_type)
+    normalized_lower = normalized.lower()
+
+    if not normalized:
+        return False
+    if len(normalized) < 2:
+        return False
+    if normalized.isdigit():
+        return False
+    if normalized_lower in TOPIC_BLOCKLIST:
+        return False
+    if topic_type == "keyword" and len(normalized_lower) < 4:
+        return False
+    if topic_type == "keyword" and normalized_lower in STOPWORD_TOKENS:
+        return False
+    return True
+
+
+def _is_proper_like_token(token: str) -> bool:
+    value = str(token or "").strip()
+    if not value:
+        return False
+    lower = value.lower()
+    if lower in STOPWORD_TOKENS or lower in TOPIC_BLOCKLIST:
+        return False
+    if value.isupper() and len(value) >= 2:
+        return True
+    if value[:1].isupper() and any(character.islower() for character in value[1:]):
+        return True
+    if any(character.isupper() for character in value[1:]) and any(character.islower() for character in value):
+        return True
+    return False
 
 
 def _infer_topic_key_candidate(
@@ -388,6 +540,135 @@ def normalize_posts_for_raw_table(
     return list(rows_by_id.values())
 
 
+def extractTopicEntities(raw_post: Dict[str, Any]) -> List[Dict[str, str]]:
+    text_content = _normalize_whitespace(
+        str(raw_post.get("text_content") or raw_post.get("raw_text") or "")
+    )
+    if not text_content:
+        return []
+
+    candidates: list[dict[str, str]] = []
+    seen_normalized: set[str] = set()
+
+    def add_candidate(topic_text: str, topic_type: str) -> None:
+        normalized_topic = _normalize_topic_value(topic_text, topic_type=topic_type)
+        normalized_key = normalized_topic.lower()
+        if not _is_valid_topic_candidate(normalized_topic, topic_type=topic_type):
+            return
+        if normalized_key in seen_normalized:
+            return
+        seen_normalized.add(normalized_key)
+        candidates.append(
+            {
+                "topic_text": _normalize_topic_text(topic_text),
+                "normalized_topic": normalized_topic,
+                "topic_type": topic_type,
+            }
+        )
+
+    # 1) Cashtags
+    for match in CASHTAG_PATTERN.finditer(text_content):
+        token = str(match.group(1) or "").strip()
+        if not token:
+            continue
+        add_candidate(f"${token}", "cashtag")
+
+    # 2) Hashtags
+    for match in HASHTAG_PATTERN.finditer(text_content):
+        token = str(match.group(1) or "").strip()
+        if not token:
+            continue
+        add_candidate(f"#{token}", "hashtag")
+
+    # 3 + 4) Proper nouns/acronyms and grouped adjacent name phrases
+    phrase_matches = list(PHRASE_TOKEN_PATTERN.finditer(text_content))
+    phrase_tokens = [match.group(0) for match in phrase_matches]
+    index = 0
+    while index < len(phrase_tokens):
+        token = phrase_tokens[index]
+        if not _is_proper_like_token(token):
+            index += 1
+            continue
+
+        grouped_tokens = [token]
+        cursor = index + 1
+        while cursor < len(phrase_tokens) and len(grouped_tokens) < 8:
+            next_token = phrase_tokens[cursor]
+            next_lower = next_token.lower()
+            between_text = text_content[
+                phrase_matches[cursor - 1].end() : phrase_matches[cursor].start()
+            ]
+            if any(marker in between_text for marker in (".", "!", "?", ";", ":", "\n")):
+                break
+            if _is_proper_like_token(next_token):
+                grouped_tokens.append(next_token)
+                cursor += 1
+                continue
+            if (
+                next_lower in TOPIC_CONNECTOR_WORDS
+                and (cursor + 1) < len(phrase_tokens)
+                and _is_proper_like_token(phrase_tokens[cursor + 1])
+            ):
+                grouped_tokens.append(next_token.lower())
+                grouped_tokens.append(phrase_tokens[cursor + 1])
+                cursor += 2
+                continue
+            break
+
+        add_candidate(" ".join(grouped_tokens), "entity")
+        index = max(index + 1, cursor)
+
+    # 5) Keyword fallback if no better topic candidates were found.
+    if not candidates:
+        for token in _extract_tokens(text_content):
+            if token in TOPIC_BLOCKLIST:
+                continue
+            if token in STOPWORD_TOKENS:
+                continue
+            add_candidate(token, "keyword")
+            if len(candidates) >= 5:
+                break
+
+    return candidates[:15]
+
+
+def extract_topic_entities(raw_post: Dict[str, Any]) -> List[Dict[str, str]]:
+    return extractTopicEntities(raw_post)
+
+
+def analyzeSentiment(*, clean_text: str, language: str | None) -> Dict[str, Any]:
+    english_tokens = re.findall(r"[a-z']+", str(clean_text or "").lower())
+    positive_score = 0
+    negative_score = 0
+    neutral_score = 0
+
+    for token in english_tokens:
+        positive_score += int(POSITIVE_SENTIMENT_LEXICON.get(token, 0))
+        negative_score += int(NEGATIVE_SENTIMENT_LEXICON.get(token, 0))
+        neutral_score += int(NEUTRAL_SENTIMENT_LEXICON.get(token, 0))
+
+    sentiment_label = "neutral"
+    if positive_score > negative_score:
+        sentiment_label = "positive"
+    elif negative_score > positive_score:
+        sentiment_label = "negative"
+
+    if positive_score == 0 and negative_score == 0:
+        sentiment_label = "neutral"
+
+    return {
+        "sentiment_label": sentiment_label,
+        "sentiment_positive_score": positive_score,
+        "sentiment_negative_score": negative_score,
+        "sentiment_neutral_score": neutral_score,
+        "sentiment_language": language,
+    }
+
+
+def analyze_sentiment(*, clean_text: str, language: str | None) -> Dict[str, Any]:
+    return analyzeSentiment(clean_text=clean_text, language=language)
+
+
 def deriveTags(
     *,
     clean_text: str,
@@ -476,6 +757,15 @@ def extractFeatures(raw_post: Dict[str, Any]) -> Dict[str, Any]:
     cashtags = _extract_cashtags(text_content)
     tokens = _extract_tokens(text_content)
     domains = _extract_domains(urls)
+    topic_entities = extractTopicEntities(
+        {
+            **raw_post,
+            "text_content": text_content,
+            "hashtags": hashtags,
+        }
+    )
+    normalized_topics = [str(row.get("normalized_topic") or "").strip() for row in topic_entities]
+    normalized_topics = [value for value in _dedupe_text(normalized_topics) if value]
 
     tags = deriveTags(
         clean_text=text_content,
@@ -484,10 +774,19 @@ def extractFeatures(raw_post: Dict[str, Any]) -> Dict[str, Any]:
         cashtags=cashtags,
         domains=domains,
     )
-    topic_key_candidate = _infer_topic_key_candidate(
-        hashtags=hashtags,
-        tokens=tokens,
-        tags=tags,
+    if any(row.get("topic_type") == "cashtag" for row in topic_entities):
+        tags = _dedupe_text([*tags, "ticker"])
+    if any(row.get("topic_type") == "entity" for row in topic_entities):
+        tags = _dedupe_text([*tags, "entity"])
+
+    topic_key_candidate = (
+        normalized_topics[0]
+        if normalized_topics
+        else _infer_topic_key_candidate(
+            hashtags=hashtags,
+            tokens=tokens,
+            tags=tags,
+        )
     )
 
     metrics_json = dict(raw_post.get("metrics_json") or {})
@@ -499,6 +798,7 @@ def extractFeatures(raw_post: Dict[str, Any]) -> Dict[str, Any]:
     )
     key_phrases = tokens[:3]
     topic_seeds = [topic_key_candidate] if topic_key_candidate else []
+    sentiment = analyzeSentiment(clean_text=text_content, language=language)
 
     return {
         "clean_text": text_content or None,
@@ -517,6 +817,9 @@ def extractFeatures(raw_post: Dict[str, Any]) -> Dict[str, Any]:
         "topic_seeds": topic_seeds,
         "quality_score": quality_score,
         "spam_score": 0.0,
+        "topic_entities": normalized_topics,
+        "topic_records": topic_entities,
+        **sentiment,
     }
 
 
@@ -549,6 +852,8 @@ def processRawPost(
     )
 
     topic_key_candidate = str(features.get("topic_key_candidate") or "general")
+    topic_entities = [str(value or "").strip() for value in (features.get("topic_entities") or [])]
+    topic_entities = [value for value in _dedupe_text(topic_entities) if value]
 
     return {
         "raw_post_id": raw_post.get("id"),
@@ -578,11 +883,17 @@ def processRawPost(
         "urls": list(features.get("urls") or []),
         "key_phrases": list(features.get("key_phrases") or []),
         "topic_seeds": list(features.get("topic_seeds") or []),
+        "topic_entities": topic_entities,
         "topic_key_candidate": topic_key_candidate,
         "tags": list(features.get("tags") or []),
         "spam_score": float(features.get("spam_score") or 0.0),
         "quality_score": float(features.get("quality_score") or 0.0),
+        "sentiment_label": str(features.get("sentiment_label") or "neutral"),
+        "sentiment_positive_score": int(features.get("sentiment_positive_score") or 0),
+        "sentiment_negative_score": int(features.get("sentiment_negative_score") or 0),
+        "sentiment_neutral_score": int(features.get("sentiment_neutral_score") or 0),
         "topic": topic_key_candidate,
+        "topic_records": list(features.get("topic_records") or []),
     }
 
 

@@ -412,16 +412,16 @@ class PostgresStore:
 
         return self._execute_write("ingest_raw_post", operation)
 
-    def upsert_processed_post(self, row: dict[str, Any]) -> int:
+    def upsert_processed_post_record(self, row: dict[str, Any]) -> dict[str, Any] | None:
         payload = self._prepare_processed_post_row(row)
         raw_post_id = payload.get("raw_post_id")
         if raw_post_id in {None, 0}:
-            return 0
+            return None
         source_post_id = str(payload.get("source_post_id") or "").strip()
         if not source_post_id:
-            return 0
+            return None
 
-        def operation(connection: psycopg.Connection[Any]) -> int:
+        def operation(connection: psycopg.Connection[Any]) -> dict[str, Any] | None:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -457,6 +457,11 @@ class PostgresStore:
                         tags,
                         spam_score,
                         quality_score,
+                        topic_entities,
+                        sentiment_label,
+                        sentiment_positive_score,
+                        sentiment_negative_score,
+                        sentiment_neutral_score,
                         topic
                     ) VALUES (
                         %(raw_post_id)s,
@@ -490,6 +495,11 @@ class PostgresStore:
                         %(tags)s,
                         %(spam_score)s,
                         %(quality_score)s,
+                        %(topic_entities)s,
+                        %(sentiment_label)s,
+                        %(sentiment_positive_score)s,
+                        %(sentiment_negative_score)s,
+                        %(sentiment_neutral_score)s,
                         %(topic)s
                     )
                     ON CONFLICT (raw_post_id) DO UPDATE
@@ -523,11 +533,19 @@ class PostgresStore:
                         tags = COALESCE(EXCLUDED.tags, public.processed_posts.tags),
                         spam_score = COALESCE(EXCLUDED.spam_score, public.processed_posts.spam_score),
                         quality_score = COALESCE(EXCLUDED.quality_score, public.processed_posts.quality_score),
+                        topic_entities = COALESCE(EXCLUDED.topic_entities, public.processed_posts.topic_entities),
+                        sentiment_label = COALESCE(EXCLUDED.sentiment_label, public.processed_posts.sentiment_label),
+                        sentiment_positive_score = COALESCE(EXCLUDED.sentiment_positive_score, public.processed_posts.sentiment_positive_score),
+                        sentiment_negative_score = COALESCE(EXCLUDED.sentiment_negative_score, public.processed_posts.sentiment_negative_score),
+                        sentiment_neutral_score = COALESCE(EXCLUDED.sentiment_neutral_score, public.processed_posts.sentiment_neutral_score),
                         topic = COALESCE(EXCLUDED.topic, public.processed_posts.topic)
+                    RETURNING id, raw_post_id, processed_at
                     """,
                     payload,
                 )
-                processed_row_count = int(cursor.rowcount or 0)
+                processed_row = cursor.fetchone()
+                if not processed_row:
+                    return None
                 cursor.execute(
                     """
                     UPDATE public.raw_posts
@@ -536,9 +554,93 @@ class PostgresStore:
                     """,
                     (raw_post_id,),
                 )
-                return processed_row_count
+                topic_entities_payload = payload.get("topic_entities")
+                if isinstance(topic_entities_payload, (list, tuple)):
+                    topic_entities_value = [
+                        str(value).strip()
+                        for value in topic_entities_payload
+                        if str(value or "").strip()
+                    ]
+                else:
+                    topic_entities_value = (
+                        [str(topic_entities_payload).strip()]
+                        if str(topic_entities_payload or "").strip()
+                        else []
+                    )
+                return {
+                    "id": int(processed_row[0]),
+                    "raw_post_id": int(processed_row[1]),
+                    "source_post_id": source_post_id,
+                    "platform": str(payload.get("platform") or ""),
+                    "processed_at": processed_row[2],
+                    "topic_entities": topic_entities_value,
+                    "language": payload.get("language"),
+                    "source_created_at": payload.get("source_created_at"),
+                    "bucket_minute": payload.get("bucket_minute"),
+                }
 
-        return self._execute_write("upsert_processed_post", operation)
+        return self._execute_write("upsert_processed_post_record", operation)
+
+    def upsert_processed_post(self, row: dict[str, Any]) -> int:
+        processed = self.upsert_processed_post_record(row)
+        return 1 if processed else 0
+
+    def persist_post_topics(self, rows: Iterable[dict[str, Any]]) -> int:
+        payload = [self._prepare_post_topic_row(row) for row in rows]
+        payload = [
+            row
+            for row in payload
+            if row.get("raw_post_id")
+            and row.get("source_post_id")
+            and row.get("normalized_topic")
+            and row.get("topic_type")
+        ]
+        if not payload:
+            return 0
+
+        def operation(connection: psycopg.Connection[Any]) -> int:
+            with connection.cursor() as cursor:
+                cursor.executemany(
+                    """
+                    INSERT INTO public.post_topics (
+                        raw_post_id,
+                        processed_post_id,
+                        platform,
+                        source_post_id,
+                        topic_text,
+                        normalized_topic,
+                        topic_type,
+                        language,
+                        source_created_at,
+                        bucket_minute,
+                        created_at
+                    ) VALUES (
+                        %(raw_post_id)s,
+                        %(processed_post_id)s,
+                        %(platform)s,
+                        %(source_post_id)s,
+                        %(topic_text)s,
+                        %(normalized_topic)s,
+                        %(topic_type)s,
+                        %(language)s,
+                        %(source_created_at)s,
+                        %(bucket_minute)s,
+                        %(created_at)s
+                    )
+                    ON CONFLICT (raw_post_id, normalized_topic, topic_type) DO UPDATE
+                    SET processed_post_id = COALESCE(EXCLUDED.processed_post_id, public.post_topics.processed_post_id),
+                        platform = COALESCE(EXCLUDED.platform, public.post_topics.platform),
+                        source_post_id = COALESCE(EXCLUDED.source_post_id, public.post_topics.source_post_id),
+                        topic_text = COALESCE(EXCLUDED.topic_text, public.post_topics.topic_text),
+                        language = COALESCE(EXCLUDED.language, public.post_topics.language),
+                        source_created_at = COALESCE(EXCLUDED.source_created_at, public.post_topics.source_created_at),
+                        bucket_minute = COALESCE(EXCLUDED.bucket_minute, public.post_topics.bucket_minute)
+                    """,
+                    payload,
+                )
+                return int(cursor.rowcount or 0)
+
+        return self._execute_write("persist_post_topics", operation)
 
     def prune_raw_posts_older_than(self, *, hours: float) -> int:
         retention_hours = max(0.0, float(hours))
@@ -1080,6 +1182,11 @@ class PostgresStore:
                         tokens TEXT[] NOT NULL DEFAULT '{}'::text[],
                         mentions TEXT[] NOT NULL DEFAULT '{}'::text[],
                         tags TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        topic_entities TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        sentiment_label TEXT NOT NULL DEFAULT 'neutral',
+                        sentiment_positive_score INTEGER NOT NULL DEFAULT 0,
+                        sentiment_negative_score INTEGER NOT NULL DEFAULT 0,
+                        sentiment_neutral_score INTEGER NOT NULL DEFAULT 0,
                         has_media BOOLEAN NOT NULL DEFAULT false,
                         is_reply BOOLEAN NOT NULL DEFAULT false,
                         is_repost BOOLEAN NOT NULL DEFAULT false,
@@ -1115,6 +1222,16 @@ class PostgresStore:
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS tokens TEXT[]")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS mentions TEXT[]")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS tags TEXT[]")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS topic_entities TEXT[]")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS sentiment_label TEXT")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS sentiment_positive_score INTEGER")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS sentiment_negative_score INTEGER")
+                cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS sentiment_neutral_score INTEGER")
+                cursor.execute("ALTER TABLE public.processed_posts ALTER COLUMN topic_entities SET DEFAULT '{}'::text[]")
+                cursor.execute("ALTER TABLE public.processed_posts ALTER COLUMN sentiment_label SET DEFAULT 'neutral'")
+                cursor.execute("ALTER TABLE public.processed_posts ALTER COLUMN sentiment_positive_score SET DEFAULT 0")
+                cursor.execute("ALTER TABLE public.processed_posts ALTER COLUMN sentiment_negative_score SET DEFAULT 0")
+                cursor.execute("ALTER TABLE public.processed_posts ALTER COLUMN sentiment_neutral_score SET DEFAULT 0")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS has_media BOOLEAN")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS is_reply BOOLEAN")
                 cursor.execute("ALTER TABLE public.processed_posts ADD COLUMN IF NOT EXISTS is_repost BOOLEAN")
@@ -1145,6 +1262,21 @@ class PostgresStore:
                         COALESCE(source_created_at, created_at, processed_at, now())
                     )
                     WHERE bucket_minute IS NULL
+                    """
+                )
+                cursor.execute(
+                    """
+                    UPDATE public.processed_posts
+                    SET sentiment_label = COALESCE(sentiment_label, 'neutral'),
+                        sentiment_positive_score = COALESCE(sentiment_positive_score, 0),
+                        sentiment_negative_score = COALESCE(sentiment_negative_score, 0),
+                        sentiment_neutral_score = COALESCE(sentiment_neutral_score, 0),
+                        topic_entities = COALESCE(topic_entities, '{}'::text[])
+                    WHERE sentiment_label IS NULL
+                       OR sentiment_positive_score IS NULL
+                       OR sentiment_negative_score IS NULL
+                       OR sentiment_neutral_score IS NULL
+                       OR topic_entities IS NULL
                     """
                 )
                 cursor.execute(
@@ -1253,6 +1385,12 @@ class PostgresStore:
                 )
                 cursor.execute(
                     """
+                    CREATE INDEX IF NOT EXISTS idx_processed_posts_sentiment_label
+                    ON public.processed_posts (sentiment_label)
+                    """
+                )
+                cursor.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS idx_processed_posts_tags_gin
                     ON public.processed_posts
                     USING GIN (tags)
@@ -1262,6 +1400,100 @@ class PostgresStore:
                     """
                     CREATE INDEX IF NOT EXISTS idx_topic_buckets_1m_platform_topic_bucket
                     ON public.topic_buckets_1m (platform, topic_key, bucket_minute DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.post_topics (
+                        id BIGSERIAL PRIMARY KEY,
+                        raw_post_id BIGINT NOT NULL,
+                        processed_post_id BIGINT,
+                        platform TEXT NOT NULL,
+                        source_post_id TEXT NOT NULL,
+                        topic_text TEXT NOT NULL,
+                        normalized_topic TEXT NOT NULL,
+                        topic_type TEXT NOT NULL,
+                        language TEXT,
+                        source_created_at TIMESTAMPTZ,
+                        bucket_minute TIMESTAMPTZ NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                cursor.execute("ALTER TABLE public.post_topics ADD COLUMN IF NOT EXISTS id BIGSERIAL")
+                cursor.execute("ALTER TABLE public.post_topics ADD COLUMN IF NOT EXISTS raw_post_id BIGINT")
+                cursor.execute("ALTER TABLE public.post_topics ADD COLUMN IF NOT EXISTS processed_post_id BIGINT")
+                cursor.execute("ALTER TABLE public.post_topics ADD COLUMN IF NOT EXISTS platform TEXT")
+                cursor.execute("ALTER TABLE public.post_topics ADD COLUMN IF NOT EXISTS source_post_id TEXT")
+                cursor.execute("ALTER TABLE public.post_topics ADD COLUMN IF NOT EXISTS topic_text TEXT")
+                cursor.execute("ALTER TABLE public.post_topics ADD COLUMN IF NOT EXISTS normalized_topic TEXT")
+                cursor.execute("ALTER TABLE public.post_topics ADD COLUMN IF NOT EXISTS topic_type TEXT")
+                cursor.execute("ALTER TABLE public.post_topics ADD COLUMN IF NOT EXISTS language TEXT")
+                cursor.execute("ALTER TABLE public.post_topics ADD COLUMN IF NOT EXISTS source_created_at TIMESTAMPTZ")
+                cursor.execute("ALTER TABLE public.post_topics ADD COLUMN IF NOT EXISTS bucket_minute TIMESTAMPTZ")
+                cursor.execute("ALTER TABLE public.post_topics ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
+                cursor.execute(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1
+                            FROM pg_constraint
+                            WHERE conname = 'post_topics_raw_post_id_fkey'
+                              AND conrelid = 'public.post_topics'::regclass
+                        ) THEN
+                            ALTER TABLE public.post_topics
+                            ADD CONSTRAINT post_topics_raw_post_id_fkey
+                            FOREIGN KEY (raw_post_id)
+                            REFERENCES public.raw_posts(id)
+                            ON DELETE CASCADE;
+                        END IF;
+                    END;
+                    $$;
+                    """
+                )
+                cursor.execute(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1
+                            FROM pg_constraint
+                            WHERE conname = 'post_topics_processed_post_id_fkey'
+                              AND conrelid = 'public.post_topics'::regclass
+                        ) THEN
+                            ALTER TABLE public.post_topics
+                            ADD CONSTRAINT post_topics_processed_post_id_fkey
+                            FOREIGN KEY (processed_post_id)
+                            REFERENCES public.processed_posts(id)
+                            ON DELETE CASCADE;
+                        END IF;
+                    END;
+                    $$;
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_post_topics_raw_topic_type
+                    ON public.post_topics (raw_post_id, normalized_topic, topic_type)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_post_topics_bucket_minute
+                    ON public.post_topics (bucket_minute)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_post_topics_normalized_topic
+                    ON public.post_topics (normalized_topic)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_post_topics_platform_bucket_minute
+                    ON public.post_topics (platform, bucket_minute)
                     """
                 )
 
@@ -1299,12 +1531,17 @@ class PostgresStore:
                         token_count,
                         mentions,
                         tags,
+                        topic_entities,
                         hashtags,
                         cashtags,
                         domains,
                         urls,
                         key_phrases,
                         topic_seeds,
+                        sentiment_label,
+                        sentiment_positive_score,
+                        sentiment_negative_score,
+                        sentiment_neutral_score,
                         spam_score,
                         topic
                     )
@@ -1332,12 +1569,17 @@ class PostgresStore:
                         0,
                         '{}'::text[],
                         ARRAY['general']::text[],
+                        ARRAY['general']::text[],
                         COALESCE(rp.hashtags, '{}'::text[]),
                         '{}'::text[],
                         '{}'::text[],
                         COALESCE(rp.urls, '{}'::text[]),
                         '{}'::text[],
                         '{}'::text[],
+                        'neutral'::text,
+                        0::int,
+                        0::int,
+                        0::int,
                         0::numeric,
                         'all'::text AS topic
                     FROM public.raw_posts rp
@@ -1515,6 +1757,12 @@ class PostgresStore:
         except (TypeError, ValueError):
             spam_score_value = 0.0
 
+        def _safe_int(value: Any, default: int = 0) -> int:
+            try:
+                return int(value if value is not None else default)
+            except (TypeError, ValueError):
+                return default
+
         topic_key_candidate = str(row.get("topic_key_candidate") or row.get("topic") or "general").strip()
         if not topic_key_candidate:
             topic_key_candidate = "general"
@@ -1540,6 +1788,7 @@ class PostgresStore:
             "urls": self._adapt_collection("processed_posts", "urls", row.get("urls")),
             "domains": self._adapt_collection("processed_posts", "domains", row.get("domains")),
             "tags": self._adapt_collection("processed_posts", "tags", row.get("tags")),
+            "topic_entities": self._adapt_collection("processed_posts", "topic_entities", row.get("topic_entities")),
             "has_media": bool(row.get("has_media", False)),
             "is_reply": bool(row.get("is_reply", False)),
             "is_repost": bool(row.get("is_repost", False)),
@@ -1550,8 +1799,28 @@ class PostgresStore:
             "cashtags": self._adapt_collection("processed_posts", "cashtags", row.get("cashtags")),
             "key_phrases": self._adapt_collection("processed_posts", "key_phrases", row.get("key_phrases")),
             "topic_seeds": self._adapt_collection("processed_posts", "topic_seeds", row.get("topic_seeds")),
+            "sentiment_label": str(row.get("sentiment_label") or "neutral").strip() or "neutral",
+            "sentiment_positive_score": _safe_int(row.get("sentiment_positive_score"), 0),
+            "sentiment_negative_score": _safe_int(row.get("sentiment_negative_score"), 0),
+            "sentiment_neutral_score": _safe_int(row.get("sentiment_neutral_score"), 0),
             "spam_score": spam_score_value,
             "topic": str(row.get("topic") or topic_key_candidate).strip() or topic_key_candidate,
+        }
+
+    def _prepare_post_topic_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        created_at = row.get("created_at") or datetime.now(timezone.utc)
+        return {
+            "raw_post_id": row.get("raw_post_id"),
+            "processed_post_id": row.get("processed_post_id"),
+            "platform": str(row.get("platform") or "bluesky").strip() or "bluesky",
+            "source_post_id": str(row.get("source_post_id") or "").strip(),
+            "topic_text": str(row.get("topic_text") or "").strip(),
+            "normalized_topic": str(row.get("normalized_topic") or "").strip(),
+            "topic_type": str(row.get("topic_type") or "entity").strip() or "entity",
+            "language": str(row.get("language") or "").strip() or None,
+            "source_created_at": row.get("source_created_at"),
+            "bucket_minute": row.get("bucket_minute") or created_at,
+            "created_at": created_at,
         }
 
     def _prepare_author_row(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -1644,6 +1913,7 @@ class PostgresStore:
                         "authors",
                         "ingestion_runs",
                         "processed_posts",
+                        "post_topics",
                     ],
                 ),
             )

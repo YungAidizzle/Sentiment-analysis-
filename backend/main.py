@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from backend.collectors.bluesky_worker import (
+    analyzeSentiment as analyzePostSentiment,
+    extractTopicEntities as extractPostTopicEntities,
     normalizeIncomingEvent,
     normalize_authors_for_authors_table,
     processRawPost as buildProcessedPostFromRaw,
@@ -51,14 +53,83 @@ def ingestRawPost(*, store: PostgresStore, normalized_event: dict[str, Any]) -> 
     return store.ingest_raw_post(normalized_event)
 
 
+def extractTopicEntities(*, raw_post: dict[str, Any]) -> list[dict[str, str]]:
+    return extractPostTopicEntities(raw_post)
+
+
+def analyzeSentiment(*, raw_post: dict[str, Any]) -> dict[str, Any]:
+    clean_text = str(raw_post.get("text_content") or raw_post.get("raw_text") or "").strip()
+    language = str(raw_post.get("language") or "").strip() or None
+    return analyzePostSentiment(clean_text=clean_text, language=language)
+
+
 def processRawPost(
     *,
     store: PostgresStore,
     raw_row: dict[str, Any],
     processed_at: datetime,
-) -> int:
+    topic_entities: list[dict[str, str]] | None = None,
+    sentiment: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    extracted_topics = list(topic_entities or extractTopicEntities(raw_post=raw_row))
+    sentiment_payload = dict(sentiment or analyzeSentiment(raw_post=raw_row))
     processed_row = buildProcessedPostFromRaw(raw_row, processed_at=processed_at)
-    return store.upsert_processed_post(processed_row)
+    if extracted_topics:
+        processed_row["topic_records"] = extracted_topics
+        processed_row["topic_entities"] = [
+            str(row.get("normalized_topic") or "").strip()
+            for row in extracted_topics
+            if str(row.get("normalized_topic") or "").strip()
+        ]
+        if not processed_row.get("topic_key_candidate"):
+            processed_row["topic_key_candidate"] = str(extracted_topics[0].get("normalized_topic") or "general")
+            processed_row["topic"] = processed_row["topic_key_candidate"]
+    processed_row.update(sentiment_payload)
+    return store.upsert_processed_post_record(processed_row)
+
+
+def persistPostTopics(
+    *,
+    store: PostgresStore,
+    raw_row: dict[str, Any],
+    processed_row: dict[str, Any],
+    topic_entities: list[dict[str, str]],
+    created_at: datetime,
+) -> int:
+    if not topic_entities:
+        return 0
+
+    source_created_at = raw_row.get("created_at") or created_at
+    bucket_minute = raw_row.get("created_at") or created_at
+    try:
+        if isinstance(bucket_minute, datetime):
+            bucket_minute = bucket_minute.replace(second=0, microsecond=0)
+    except Exception:
+        bucket_minute = created_at.replace(second=0, microsecond=0)
+
+    rows: list[dict[str, Any]] = []
+    for topic in topic_entities:
+        normalized_topic = str(topic.get("normalized_topic") or "").strip()
+        if not normalized_topic:
+            continue
+        topic_text = str(topic.get("topic_text") or normalized_topic).strip() or normalized_topic
+        rows.append(
+            {
+                "raw_post_id": raw_row.get("id"),
+                "processed_post_id": processed_row.get("id"),
+                "platform": str(raw_row.get("platform") or "bluesky"),
+                "source_post_id": str(raw_row.get("source_post_id") or raw_row.get("post_id") or "").strip(),
+                "topic_text": topic_text,
+                "normalized_topic": normalized_topic,
+                "topic_type": str(topic.get("topic_type") or "entity"),
+                "language": str(raw_row.get("language") or "").strip() or None,
+                "source_created_at": source_created_at,
+                "bucket_minute": bucket_minute,
+                "created_at": created_at,
+            }
+        )
+
+    return store.persist_post_topics(rows)
 
 
 def _build_run_notes(
@@ -394,6 +465,7 @@ def main() -> int:
 
                 inserted_posts = 0
                 processed_posts = 0
+                post_topics_persisted = 0
                 processing_errors = 0
                 for normalized_event in normalized_events:
                     ingested_raw = ingestRawPost(
@@ -405,11 +477,24 @@ def main() -> int:
                     inserted_posts += 1
 
                     try:
-                        processed_posts += processRawPost(
+                        topic_entities = extractTopicEntities(raw_post=ingested_raw)
+                        sentiment = analyzeSentiment(raw_post=ingested_raw)
+                        processed_result = processRawPost(
                             store=store,
                             raw_row=ingested_raw,
                             processed_at=ingested_at,
+                            topic_entities=topic_entities,
+                            sentiment=sentiment,
                         )
+                        if processed_result:
+                            processed_posts += 1
+                            post_topics_persisted += persistPostTopics(
+                                store=store,
+                                raw_row=ingested_raw,
+                                processed_row=processed_result,
+                                topic_entities=topic_entities,
+                                created_at=ingested_at,
+                            )
                     except Exception as processing_error:
                         processing_errors += 1
                         log_event(
@@ -462,6 +547,7 @@ def main() -> int:
                     posts_normalized=len(normalized_events),
                     posts_inserted=inserted_posts,
                     posts_processed=processed_posts,
+                    post_topics_persisted=post_topics_persisted,
                     processing_errors=processing_errors,
                     authors_upserted=upserted_authors,
                     rows_inserted_total=rows_inserted_total,
