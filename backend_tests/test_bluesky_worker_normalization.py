@@ -2,12 +2,38 @@ import unittest
 from datetime import datetime, timezone
 
 from backend.collectors.bluesky_worker import (
+    extractFeatures,
+    normalizeIncomingEvent,
     normalize_authors_for_authors_table,
     normalize_posts_for_raw_table,
+    processRawPost,
 )
 
 
 class BlueskyWorkerNormalizationTests(unittest.TestCase):
+    def test_normalize_incoming_event_maps_source_post_fields(self):
+        ingested_at = datetime(2026, 3, 25, 10, 0, tzinfo=timezone.utc)
+        event = {
+            "id": "at://did:plc:abc/app.bsky.feed.post/123",
+            "uri": "at://did:plc:abc/app.bsky.feed.post/123",
+            "cid": "cid-123",
+            "authorDid": "did:plc:abc",
+            "authorHandle": "alice.bsky.social",
+            "createdUtc": int(datetime(2026, 3, 25, 9, 30, tzinfo=timezone.utc).timestamp()),
+            "summary": "Shipping update https://example.com #Dropshipping",
+            "langs": ["en"],
+        }
+
+        row = normalizeIncomingEvent(event, ingested_at=ingested_at)
+
+        self.assertIsNotNone(row)
+        if row is None:
+            return
+        self.assertEqual(row["source_post_id"], event["uri"])
+        self.assertEqual(row["source_cid"], "cid-123")
+        self.assertEqual(row["platform"], "bluesky")
+        self.assertEqual(row["hashtags"], ["dropshipping"])
+
     def test_normalize_posts_for_raw_table_maps_required_fields(self):
         ingested_at = datetime(2026, 3, 25, 10, 0, tzinfo=timezone.utc)
         posts = [
@@ -44,6 +70,32 @@ class BlueskyWorkerNormalizationTests(unittest.TestCase):
         self.assertEqual(row["hashtags"], ["ai"])
         self.assertEqual(row["metrics_json"]["likeCount"], 5)
         self.assertEqual(row["raw_json"]["id"], posts[0]["id"])
+
+    def test_extract_features_and_process_raw_post_adds_generic_fields(self):
+        raw_row = {
+            "id": 99,
+            "platform": "bluesky",
+            "source_post_id": "at://did:plc:abc/app.bsky.feed.post/999",
+            "post_id": "at://did:plc:abc/app.bsky.feed.post/999",
+            "author_id": "did:plc:abc",
+            "created_at": datetime(2026, 3, 25, 9, 30, tzinfo=timezone.utc),
+            "text_content": "New $DOGE memecoin drop + dropshipping product idea https://example.com #Crypto @alice",
+            "language": "en",
+            "metrics_json": {"likeCount": 10, "replyCount": 3, "repostCount": 2, "quoteCount": 1},
+            "raw_json": {"quotedUri": "at://did:plc:def/app.bsky.feed.post/1"},
+        }
+
+        features = extractFeatures(raw_row)
+        processed = processRawPost(raw_row, processed_at=datetime(2026, 3, 25, 10, 0, tzinfo=timezone.utc))
+
+        self.assertIn("tokens", features)
+        self.assertIn("tags", features)
+        self.assertIn("memecoin", features["tags"])
+        self.assertIn("dropshipping", features["tags"])
+        self.assertEqual(processed["raw_post_id"], 99)
+        self.assertEqual(processed["topic_key_candidate"], processed["topic"])
+        self.assertEqual(processed["mentions"], ["alice"])
+        self.assertEqual(processed["domains"], ["example.com"])
 
     def test_normalize_authors_for_authors_table_merges_profile_and_post_rows(self):
         observed_at = datetime(2026, 3, 25, 10, 0, tzinfo=timezone.utc)

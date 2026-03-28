@@ -9,8 +9,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 from backend.collectors.bluesky_worker import (
+    normalizeIncomingEvent,
     normalize_authors_for_authors_table,
-    normalize_posts_for_raw_table,
+    processRawPost as buildProcessedPostFromRaw,
     run_firehose_window,
 )
 from backend.config import WorkerConfig
@@ -44,6 +45,20 @@ def _state_summary(state: dict[str, Any] | None) -> dict[str, Any]:
         "rawPersistSuccessRate": state.get("rawPersistSuccessRate"),
         "normalizationSuccessRate": state.get("normalizationSuccessRate"),
     }
+
+
+def ingestRawPost(*, store: PostgresStore, normalized_event: dict[str, Any]) -> dict[str, Any] | None:
+    return store.ingest_raw_post(normalized_event)
+
+
+def processRawPost(
+    *,
+    store: PostgresStore,
+    raw_row: dict[str, Any],
+    processed_at: datetime,
+) -> int:
+    processed_row = buildProcessedPostFromRaw(raw_row, processed_at=processed_at)
+    return store.upsert_processed_post(processed_row)
 
 
 def _build_run_notes(
@@ -125,6 +140,7 @@ def main() -> int:
 
     try:
         store.verify_connection()
+        store.ensure_processed_topic_tables()
         log_event(logger, logging.INFO, "db_connected", source=source)
     except Exception as error:
         log_event(logger, logging.ERROR, "db_connect_failed", source=source, error=str(error))
@@ -315,14 +331,57 @@ def main() -> int:
                 stats = dict(result.get("stats") or {})
                 timings = dict(result.get("timings") or {})
 
-                raw_post_rows = normalize_posts_for_raw_table(posts, ingested_at=ingested_at)
+                normalized_by_source_id: dict[str, dict[str, Any]] = {}
+                for event in posts:
+                    normalized_event = normalizeIncomingEvent(event, ingested_at=ingested_at)
+                    if not normalized_event:
+                        continue
+                    source_id = str(
+                        normalized_event.get("source_post_id")
+                        or normalized_event.get("post_id")
+                        or ""
+                    ).strip()
+                    if not source_id:
+                        continue
+                    normalized_by_source_id[source_id] = normalized_event
+
+                normalized_events = list(normalized_by_source_id.values())
                 author_rows = normalize_authors_for_authors_table(
                     profiles=profiles,
                     posts=posts,
                     observed_at=ingested_at,
                 )
 
-                inserted_posts = store.upsert_raw_posts(raw_post_rows)
+                inserted_posts = 0
+                processed_posts = 0
+                processing_errors = 0
+                for normalized_event in normalized_events:
+                    ingested_raw = ingestRawPost(
+                        store=store,
+                        normalized_event=normalized_event,
+                    )
+                    if not ingested_raw:
+                        continue
+                    inserted_posts += 1
+
+                    try:
+                        processed_posts += processRawPost(
+                            store=store,
+                            raw_row=ingested_raw,
+                            processed_at=ingested_at,
+                        )
+                    except Exception as processing_error:
+                        processing_errors += 1
+                        log_event(
+                            logger,
+                            logging.ERROR,
+                            "process_raw_post_failed",
+                            cycle=cycle,
+                            raw_post_id=ingested_raw.get("id"),
+                            source_post_id=ingested_raw.get("source_post_id"),
+                            error=str(processing_error),
+                        )
+
                 upserted_authors = store.upsert_authors(author_rows)
                 rows_inserted_total += inserted_posts
 
@@ -360,8 +419,10 @@ def main() -> int:
                     "cycle_complete",
                     cycle=cycle,
                     events_processed=int(state.get("lastSyncEvents") or 0),
-                    posts_normalized=len(raw_post_rows),
+                    posts_normalized=len(normalized_events),
                     posts_inserted=inserted_posts,
+                    posts_processed=processed_posts,
+                    processing_errors=processing_errors,
                     authors_upserted=upserted_authors,
                     rows_inserted_total=rows_inserted_total,
                     cursor_us=cursor_us or 0,

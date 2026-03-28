@@ -7,7 +7,9 @@ from backend.db import PostgresStore
 
 
 SCHEMA_ROWS = [
+    ("raw_posts", "id", "bigint", "int8"),
     ("raw_posts", "platform", "text", "text"),
+    ("raw_posts", "source_post_id", "text", "text"),
     ("raw_posts", "post_id", "text", "text"),
     ("raw_posts", "author_id", "text", "text"),
     ("raw_posts", "author_handle", "text", "text"),
@@ -21,6 +23,38 @@ SCHEMA_ROWS = [
     ("raw_posts", "hashtags", "ARRAY", "_text"),
     ("raw_posts", "metrics_json", "jsonb", "jsonb"),
     ("raw_posts", "raw_json", "jsonb", "jsonb"),
+    ("processed_posts", "raw_post_id", "bigint", "int8"),
+    ("processed_posts", "platform", "text", "text"),
+    ("processed_posts", "source_post_id", "text", "text"),
+    ("processed_posts", "source_created_at", "timestamp with time zone", "timestamptz"),
+    ("processed_posts", "created_at", "timestamp with time zone", "timestamptz"),
+    ("processed_posts", "processed_at", "timestamp with time zone", "timestamptz"),
+    ("processed_posts", "bucket_minute", "timestamp with time zone", "timestamptz"),
+    ("processed_posts", "clean_text", "text", "text"),
+    ("processed_posts", "normalized_text", "text", "text"),
+    ("processed_posts", "language", "text", "text"),
+    ("processed_posts", "quality_score", "double precision", "float8"),
+    ("processed_posts", "topic_key_candidate", "text", "text"),
+    ("processed_posts", "tokens", "ARRAY", "_text"),
+    ("processed_posts", "hashtags", "ARRAY", "_text"),
+    ("processed_posts", "mentions", "ARRAY", "_text"),
+    ("processed_posts", "urls", "ARRAY", "_text"),
+    ("processed_posts", "domains", "ARRAY", "_text"),
+    ("processed_posts", "tags", "ARRAY", "_text"),
+    ("processed_posts", "cashtags", "ARRAY", "_text"),
+    ("processed_posts", "key_phrases", "ARRAY", "_text"),
+    ("processed_posts", "topic_seeds", "ARRAY", "_text"),
+    ("processed_posts", "has_media", "boolean", "bool"),
+    ("processed_posts", "is_reply", "boolean", "bool"),
+    ("processed_posts", "is_repost", "boolean", "bool"),
+    ("processed_posts", "is_quote", "boolean", "bool"),
+    ("processed_posts", "author_hash", "text", "text"),
+    ("processed_posts", "token_count", "integer", "int4"),
+    ("processed_posts", "fingerprint", "text", "text"),
+    ("processed_posts", "spam_score", "numeric", "numeric"),
+    ("processed_posts", "topic", "text", "text"),
+    ("processed_posts", "post_id", "text", "text"),
+    ("processed_posts", "author_id", "text", "text"),
     ("authors", "platform", "text", "text"),
     ("authors", "author_id", "text", "text"),
     ("authors", "author_handle", "text", "text"),
@@ -66,6 +100,32 @@ class FakeCursor:
             return
         if "select notes" in normalized and "from public.ingestion_runs" in normalized:
             self._fetchone = (json.dumps({"last_cursor_us": 987654321}),)
+            self._fetchall = []
+            self.rowcount = 1
+            return
+        if "insert into public.raw_posts" in normalized and "returning" in normalized:
+            self._fetchone = (
+                42,
+                "bluesky",
+                "at://did:plc:abc/app.bsky.feed.post/xyz",
+                "at://did:plc:abc/app.bsky.feed.post/xyz",
+                "did:plc:abc",
+                "test.bsky.social",
+                None,
+                None,
+                datetime(2026, 3, 25, tzinfo=timezone.utc),
+                datetime(2026, 3, 25, tzinfo=timezone.utc),
+                datetime(2026, 3, 25, tzinfo=timezone.utc),
+                "test",
+                "test",
+                "en",
+                ["https://example.com"],
+                ["ai"],
+                None,
+                None,
+                {"likeCount": 1},
+                {"id": "at://did:plc:abc/app.bsky.feed.post/xyz"},
+            )
             self._fetchall = []
             self.rowcount = 1
             return
@@ -203,6 +263,82 @@ class WorkerDbTests(unittest.TestCase):
         query, _payload = fake_connection.executemany_calls[0]
         self.assertIn("INSERT INTO public.authors", query)
         self.assertIn("ON CONFLICT (platform, author_id) DO UPDATE", query)
+
+    @patch("backend.db.psycopg.connect")
+    def test_ingest_raw_post_returns_raw_post_id(self, connect_mock):
+        fake_connection = FakeConnection()
+        connect_mock.return_value = fake_connection
+        store = PostgresStore(
+            database_url="postgresql://example",
+            batch_size=50,
+        )
+
+        ingested = store.ingest_raw_post(
+            {
+                "platform": "bluesky",
+                "source_post_id": "at://did:plc:abc/app.bsky.feed.post/xyz",
+                "post_id": "at://did:plc:abc/app.bsky.feed.post/xyz",
+                "author_id": "did:plc:abc",
+                "author_handle": "test.bsky.social",
+                "created_at": datetime(2026, 3, 25, tzinfo=timezone.utc),
+                "ingested_at": datetime(2026, 3, 25, tzinfo=timezone.utc),
+                "text_content": "test",
+                "language": "en",
+                "urls": ["https://example.com"],
+                "hashtags": ["ai"],
+                "metrics_json": {"likeCount": 1},
+                "raw_json": {"id": "at://did:plc:abc/app.bsky.feed.post/xyz"},
+            }
+        )
+
+        self.assertIsNotNone(ingested)
+        if ingested is None:
+            return
+        self.assertEqual(ingested["id"], 42)
+        queries = [str(query) for query, _params in fake_connection.execute_calls]
+        ingest_query = next(query for query in queries if "INSERT INTO public.raw_posts" in query and "RETURNING" in query)
+        self.assertIn("ON CONFLICT (platform, source_post_id) DO UPDATE", ingest_query)
+
+    @patch("backend.db.psycopg.connect")
+    def test_upsert_processed_post_uses_raw_post_id_conflict(self, connect_mock):
+        fake_connection = FakeConnection()
+        connect_mock.return_value = fake_connection
+        store = PostgresStore(
+            database_url="postgresql://example",
+            batch_size=50,
+        )
+
+        affected = store.upsert_processed_post(
+            {
+                "raw_post_id": 42,
+                "platform": "bluesky",
+                "source_post_id": "at://did:plc:abc/app.bsky.feed.post/xyz",
+                "post_id": "at://did:plc:abc/app.bsky.feed.post/xyz",
+                "author_id": "did:plc:abc",
+                "source_created_at": datetime(2026, 3, 25, 9, 30, tzinfo=timezone.utc),
+                "created_at": datetime(2026, 3, 25, 9, 30, tzinfo=timezone.utc),
+                "processed_at": datetime(2026, 3, 25, 10, 0, tzinfo=timezone.utc),
+                "bucket_minute": datetime(2026, 3, 25, 9, 30, tzinfo=timezone.utc),
+                "clean_text": "test",
+                "normalized_text": "test",
+                "language": "en",
+                "quality_score": 0.9,
+                "topic_key_candidate": "ai",
+                "tokens": ["test", "ai"],
+                "hashtags": ["ai"],
+                "mentions": ["alice"],
+                "urls": ["https://example.com"],
+                "domains": ["example.com"],
+                "tags": ["general"],
+                "topic": "ai",
+            }
+        )
+
+        self.assertEqual(affected, 1)
+        queries = [str(query) for query, _params in fake_connection.execute_calls]
+        processed_query = next(query for query in queries if "INSERT INTO public.processed_posts" in query)
+        self.assertIn("ON CONFLICT (raw_post_id) DO UPDATE", processed_query)
+        self.assertTrue(any("UPDATE public.raw_posts" in query for query in queries))
 
     @patch("backend.db.psycopg.connect")
     def test_ensure_metric_bucket_tables_creates_required_tables(self, connect_mock):
