@@ -38,11 +38,13 @@ class WorkerConfig:
     loop_sleep_seconds: float
     retry_seconds: float
     topic_aggregate_interval_seconds: float
+    topic_cleanup_interval_seconds: float
     topic_fact_sync_lookback_hours: int
     topic_read_model_lag_minutes: int
     topic_read_model_recompute_hours: int
     topic_read_model_series_max_topics: int
     topic_read_model_series_min_mentions: int
+    worker_stale_run_minutes: int
     progress_update_seconds: float
     raw_retention_hours: float
     raw_cleanup_interval_seconds: float
@@ -92,6 +94,11 @@ class WorkerConfig:
             20.0,
             minimum=0.0,
         )
+        configured_topic_cleanup_interval_seconds = _parse_float_env(
+            "BLUESKY_TOPIC_CLEANUP_INTERVAL_SECONDS",
+            300.0,
+            minimum=20.0,
+        )
         topic_fact_sync_lookback_hours = _parse_int_env(
             "BLUESKY_TOPIC_FACT_SYNC_LOOKBACK_HOURS",
             72,
@@ -116,6 +123,11 @@ class WorkerConfig:
             "BLUESKY_TOPIC_READ_MODEL_SERIES_MIN_MENTIONS",
             2,
             minimum=1,
+        )
+        worker_stale_run_minutes = _parse_int_env(
+            "BLUESKY_WORKER_STALE_RUN_MINUTES",
+            30,
+            minimum=5,
         )
         progress_update_seconds = _parse_float_env(
             "BLUESKY_WORKER_PROGRESS_UPDATE_SECONDS",
@@ -162,11 +174,13 @@ class WorkerConfig:
                 if topic_aggregate_interval_seconds is not None
                 else configured_topic_aggregate_interval_seconds,
             ),
+            topic_cleanup_interval_seconds=configured_topic_cleanup_interval_seconds,
             topic_fact_sync_lookback_hours=topic_fact_sync_lookback_hours,
             topic_read_model_lag_minutes=topic_read_model_lag_minutes,
             topic_read_model_recompute_hours=topic_read_model_recompute_hours,
             topic_read_model_series_max_topics=topic_read_model_series_max_topics,
             topic_read_model_series_min_mentions=topic_read_model_series_min_mentions,
+            worker_stale_run_minutes=worker_stale_run_minutes,
             progress_update_seconds=progress_update_seconds,
             raw_retention_hours=max(
                 MIN_RAW_RETENTION_HOURS_FOR_24H_TRENDS,

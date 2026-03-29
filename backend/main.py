@@ -180,6 +180,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Minimum seconds between topic_buckets_1m refreshes. Set 0 to disable.",
     )
+    parser.add_argument(
+        "--topic-cleanup-interval-seconds",
+        type=float,
+        default=None,
+        help="Minimum seconds between topic mention cleanup passes.",
+    )
     parser.add_argument("--source", type=str, default="")
     parser.add_argument(
         "--max-cycles",
@@ -346,6 +352,8 @@ def main() -> int:
     run_status = "running"
     last_raw_cleanup_at_monotonic = 0.0
     last_topic_aggregate_at_monotonic = 0.0
+    last_topic_cleanup_at_monotonic = 0.0
+    worker_lease_acquired = False
 
     stop_requested = False
 
@@ -394,7 +402,7 @@ def main() -> int:
             last_raw_cleanup_at_monotonic = now_monotonic
 
     def run_topic_aggregation_if_due(*, force: bool = False, reason: str) -> None:
-        nonlocal last_topic_aggregate_at_monotonic
+        nonlocal last_topic_aggregate_at_monotonic, last_topic_cleanup_at_monotonic
         if config.topic_aggregate_interval_seconds <= 0:
             return
 
@@ -413,17 +421,29 @@ def main() -> int:
 
         started_monotonic = time.monotonic()
         started_at = _utc_now().isoformat()
+        cleanup_interval_seconds = (
+            max(0.0, float(args.topic_cleanup_interval_seconds))
+            if args.topic_cleanup_interval_seconds is not None
+            else config.topic_cleanup_interval_seconds
+        )
+        cleanup_due = force or (
+            last_topic_cleanup_at_monotonic <= 0
+            or (started_monotonic - last_topic_cleanup_at_monotonic) >= cleanup_interval_seconds
+        )
         try:
             topic_rows_affected = store.aggregate_topic_buckets_1m_from_processed_posts()
             stable_fact_rows = store.sync_post_topic_mentions_from_post_topics(
                 lookback_hours=config.topic_fact_sync_lookback_hours,
             )
-            stable_cleanup_rows = store.cleanup_garbage_post_topic_mentions(
-                lookback_hours=max(
-                    config.topic_fact_sync_lookback_hours,
-                    config.topic_read_model_recompute_hours,
-                ),
-            )
+            stable_cleanup_rows = 0
+            if cleanup_due:
+                stable_cleanup_rows = store.cleanup_garbage_post_topic_mentions(
+                    lookback_hours=max(
+                        config.topic_fact_sync_lookback_hours,
+                        config.topic_read_model_recompute_hours,
+                    ),
+                )
+                last_topic_cleanup_at_monotonic = started_monotonic
             stable_refresh = store.refresh_stable_topic_read_models(
                 lag_minutes=config.topic_read_model_lag_minutes,
                 recompute_hours=config.topic_read_model_recompute_hours,
@@ -440,6 +460,8 @@ def main() -> int:
                 rows_affected=topic_rows_affected,
                 stable_fact_rows=stable_fact_rows,
                 stable_cleanup_rows=stable_cleanup_rows,
+                cleanup_due=cleanup_due,
+                cleanup_interval_seconds=cleanup_interval_seconds,
                 stable_refresh=stable_refresh,
                 min_interval_seconds=config.topic_aggregate_interval_seconds,
                 duration_ms=duration_ms,
@@ -456,6 +478,8 @@ def main() -> int:
                 reason=reason,
                 error=str(aggregation_error),
                 min_interval_seconds=config.topic_aggregate_interval_seconds,
+                cleanup_due=cleanup_due,
+                cleanup_interval_seconds=cleanup_interval_seconds,
                 duration_ms=duration_ms,
                 last_run_delta_seconds=since_last_seconds,
                 started_at=started_at,
@@ -475,6 +499,31 @@ def main() -> int:
     )
 
     try:
+        lease = store.acquire_worker_lease(
+            source=source,
+            stale_after_minutes=config.worker_stale_run_minutes,
+        )
+        if not bool(lease.get("acquired")):
+            log_event(
+                logger,
+                logging.WARNING,
+                "worker_lease_unavailable",
+                source=source,
+                stale_after_minutes=config.worker_stale_run_minutes,
+            )
+            store.close()
+            return 0
+
+        worker_lease_acquired = True
+        log_event(
+            logger,
+            logging.INFO,
+            "worker_lease_acquired",
+            source=source,
+            stale_after_minutes=config.worker_stale_run_minutes,
+            closed_stale_runs=int(lease.get("closed_stale_runs") or 0),
+        )
+
         store.create_ingestion_run(
             source=source,
             started_at=started_at,
@@ -502,6 +551,12 @@ def main() -> int:
         topic_read_model_recompute_hours=config.topic_read_model_recompute_hours,
         topic_read_model_series_max_topics=config.topic_read_model_series_max_topics,
         topic_read_model_series_min_mentions=config.topic_read_model_series_min_mentions,
+        topic_cleanup_interval_seconds=(
+            max(0.0, float(args.topic_cleanup_interval_seconds))
+            if args.topic_cleanup_interval_seconds is not None
+            else config.topic_cleanup_interval_seconds
+        ),
+        worker_stale_run_minutes=config.worker_stale_run_minutes,
         raw_retention_hours=config.raw_retention_hours,
         raw_cleanup_interval_seconds=config.raw_cleanup_interval_seconds,
     )
@@ -791,6 +846,24 @@ def main() -> int:
                 source=source,
                 error=str(error),
             )
+        if worker_lease_acquired:
+            try:
+                released = store.release_worker_lease(source=source)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "worker_lease_released",
+                    source=source,
+                    released=bool(released),
+                )
+            except Exception as error:
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "worker_lease_release_failed",
+                    source=source,
+                    error=str(error),
+                )
         store.close()
 
     log_event(

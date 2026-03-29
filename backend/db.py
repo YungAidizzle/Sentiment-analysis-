@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -9,6 +10,15 @@ from typing import Any
 
 import psycopg
 from psycopg.types.json import Jsonb
+
+from backend.topic_rules import (
+    TOPIC_ACRONYM_ALLOWLIST,
+    TOPIC_GENERIC_WEAK_TOKENS,
+    TOPIC_NOISE_TOKENS,
+    TOPIC_NUMBER_WORD_TOKENS,
+    TOPIC_URL_DEBRIS_TOKENS,
+    seed_topic_alias_rows,
+)
 
 
 def _chunked(rows: Sequence[dict[str, Any]], size: int) -> Iterator[Sequence[dict[str, Any]]]:
@@ -35,6 +45,11 @@ def _normalize_text_list(values: Any) -> list[str]:
         seen.add(text)
         normalized.append(text)
     return normalized
+
+
+def _worker_lock_key(source: str) -> int:
+    digest = hashlib.sha1(str(source or "worker").encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False) & 0x7FFFFFFFFFFFFFFF
 
 
 class PostgresStore:
@@ -218,6 +233,61 @@ class PostgresStore:
                     )
 
         self._execute_write("update_ingestion_run", operation)
+
+    def acquire_worker_lease(
+        self,
+        *,
+        source: str,
+        stale_after_minutes: int = 30,
+    ) -> dict[str, Any]:
+        stale_after_minutes = max(5, int(stale_after_minutes))
+        source_value = str(source or "").strip() or "bluesky_firehose_worker"
+        lock_key = _worker_lock_key(source_value)
+
+        def operation(connection: psycopg.Connection[Any]) -> dict[str, Any]:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+                acquired = bool((cursor.fetchone() or [False])[0])
+                closed_stale_runs = 0
+                if acquired:
+                    cursor.execute(
+                        """
+                        WITH stale AS (
+                            UPDATE public.ingestion_runs r
+                            SET ended_at = now(),
+                                status = CASE
+                                    WHEN COALESCE(NULLIF(TRIM(r.status), ''), 'running') = 'running'
+                                        THEN 'abandoned'
+                                    ELSE r.status
+                                END
+                            WHERE r.source = %s
+                              AND r.ended_at IS NULL
+                              AND r.started_at < now() - make_interval(mins => %s)
+                            RETURNING 1
+                        )
+                        SELECT COUNT(*)::bigint FROM stale
+                        """,
+                        (source_value, stale_after_minutes),
+                    )
+                    closed_stale_runs = int((cursor.fetchone() or [0])[0] or 0)
+                return {
+                    "acquired": acquired,
+                    "lock_key": lock_key,
+                    "closed_stale_runs": closed_stale_runs,
+                }
+
+        return self._execute_write("acquire_worker_lease", operation)
+
+    def release_worker_lease(self, *, source: str) -> bool:
+        source_value = str(source or "").strip() or "bluesky_firehose_worker"
+        lock_key = _worker_lock_key(source_value)
+
+        def operation(connection: psycopg.Connection[Any]) -> bool:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                return bool((cursor.fetchone() or [False])[0])
+
+        return self._execute_write("release_worker_lease", operation)
 
     def upsert_raw_posts(self, rows: Iterable[dict[str, Any]]) -> int:
         payload = [self._prepare_raw_post_row(row) for row in rows]
@@ -672,6 +742,7 @@ class PostgresStore:
 
     def ensure_stable_topic_read_model_tables(self) -> None:
         def operation(connection: psycopg.Connection[Any]) -> None:
+            alias_rows = seed_topic_alias_rows()
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -688,6 +759,80 @@ class PostgresStore:
                 )
                 cursor.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS public.topic_alias_rules (
+                        alias_key TEXT PRIMARY KEY,
+                        canonical_key TEXT NOT NULL,
+                        canonical_label TEXT NOT NULL,
+                        entity_type TEXT NOT NULL DEFAULT 'entity',
+                        confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                        is_active BOOLEAN NOT NULL DEFAULT true,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_topic_alias_rules_canonical_key
+                    ON public.topic_alias_rules (canonical_key)
+                    """
+                )
+                if alias_rows:
+                    cursor.executemany(
+                        """
+                        INSERT INTO public.topic_alias_rules (
+                            alias_key,
+                            canonical_key,
+                            canonical_label,
+                            entity_type,
+                            confidence,
+                            is_active,
+                            updated_at
+                        ) VALUES (%s, %s, %s, %s, %s, true, now())
+                        ON CONFLICT (alias_key) DO UPDATE
+                        SET canonical_key = EXCLUDED.canonical_key,
+                            canonical_label = EXCLUDED.canonical_label,
+                            entity_type = EXCLUDED.entity_type,
+                            confidence = EXCLUDED.confidence,
+                            is_active = true,
+                            updated_at = now()
+                        """,
+                        alias_rows,
+                    )
+                    cursor.executemany(
+                        """
+                        INSERT INTO public.topics (
+                            topic_key,
+                            canonical_label,
+                            entity_type,
+                            aliases,
+                            is_active,
+                            updated_at
+                        ) VALUES (%s, %s, %s, ARRAY[%s]::text[], true, now())
+                        ON CONFLICT (topic_key) DO UPDATE
+                        SET canonical_label = EXCLUDED.canonical_label,
+                            entity_type = EXCLUDED.entity_type,
+                            aliases = (
+                                SELECT ARRAY(
+                                    SELECT DISTINCT a
+                                    FROM unnest(public.topics.aliases || EXCLUDED.aliases) AS a
+                                )
+                            ),
+                            is_active = true,
+                            updated_at = now()
+                        """,
+                        [
+                            (
+                                canonical_key,
+                                canonical_label,
+                                entity_type,
+                                alias_key,
+                            )
+                            for alias_key, canonical_key, canonical_label, entity_type, _confidence in alias_rows
+                        ],
+                    )
+                cursor.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS public.post_topic_mentions (
                         mention_id BIGSERIAL PRIMARY KEY,
                         raw_post_id BIGINT NOT NULL,
@@ -700,10 +845,17 @@ class PostgresStore:
                         author_id TEXT,
                         sentiment_label TEXT NOT NULL DEFAULT 'neutral',
                         quality_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        topic_confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
                         is_repost BOOLEAN NOT NULL DEFAULT false,
                         is_reply BOOLEAN NOT NULL DEFAULT false,
                         has_link BOOLEAN NOT NULL DEFAULT false
                     )
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE public.post_topic_mentions
+                    ADD COLUMN IF NOT EXISTS topic_confidence DOUBLE PRECISION NOT NULL DEFAULT 0
                     """
                 )
                 cursor.execute(
@@ -736,9 +888,16 @@ class PostgresStore:
                         positive_count INTEGER NOT NULL DEFAULT 0,
                         neutral_count INTEGER NOT NULL DEFAULT 0,
                         negative_count INTEGER NOT NULL DEFAULT 0,
+                        avg_topic_confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
                         finalized_at TIMESTAMPTZ NOT NULL,
                         PRIMARY KEY (bucket_minute, platform, topic_key)
                     )
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE public.topic_buckets_1m_final
+                    ADD COLUMN IF NOT EXISTS avg_topic_confidence DOUBLE PRECISION NOT NULL DEFAULT 0
                     """
                 )
                 cursor.execute(
@@ -766,6 +925,7 @@ class PostgresStore:
                         positive_count INTEGER NOT NULL DEFAULT 0,
                         neutral_count INTEGER NOT NULL DEFAULT 0,
                         negative_count INTEGER NOT NULL DEFAULT 0,
+                        avg_topic_confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
                         first_seen_at TIMESTAMPTZ NOT NULL,
                         last_seen_at TIMESTAMPTZ NOT NULL,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -775,8 +935,50 @@ class PostgresStore:
                 )
                 cursor.execute(
                     """
+                    ALTER TABLE public.topic_day_totals
+                    ADD COLUMN IF NOT EXISTS avg_topic_confidence DOUBLE PRECISION NOT NULL DEFAULT 0
+                    """
+                )
+                cursor.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS idx_topic_day_totals_day_mentions
                     ON public.topic_day_totals (day, total_mentions DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.topic_read_model_state (
+                        id SMALLINT PRIMARY KEY CHECK (id = 1),
+                        last_finalize_before TIMESTAMPTZ,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.topic_rolling_24h (
+                        topic_key TEXT PRIMARY KEY,
+                        topic_label TEXT NOT NULL,
+                        platform_count INTEGER NOT NULL,
+                        total_mentions INTEGER NOT NULL,
+                        unique_posts INTEGER NOT NULL,
+                        unique_authors INTEGER NOT NULL,
+                        positive_count INTEGER NOT NULL DEFAULT 0,
+                        neutral_count INTEGER NOT NULL DEFAULT 0,
+                        negative_count INTEGER NOT NULL DEFAULT 0,
+                        avg_topic_confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        first_seen_at TIMESTAMPTZ NOT NULL,
+                        last_seen_at TIMESTAMPTZ NOT NULL,
+                        window_start TIMESTAMPTZ NOT NULL,
+                        window_end TIMESTAMPTZ NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_topic_rolling_24h_mentions
+                    ON public.topic_rolling_24h (total_mentions DESC, topic_key)
                     """
                 )
                 cursor.execute(
@@ -813,6 +1015,7 @@ class PostgresStore:
                         positive_count,
                         neutral_count,
                         negative_count,
+                        avg_topic_confidence,
                         first_seen_at,
                         last_seen_at,
                         updated_at
@@ -833,11 +1036,60 @@ class PostgresStore:
                     FROM public.topic_day_series_5m
                     """
                 )
+                cursor.execute(
+                    """
+                    CREATE OR REPLACE VIEW public.v_topic_leaderboard_rolling_24h AS
+                    SELECT
+                        topic_key,
+                        topic_label,
+                        platform_count,
+                        total_mentions,
+                        unique_posts,
+                        unique_authors,
+                        positive_count,
+                        neutral_count,
+                        negative_count,
+                        avg_topic_confidence,
+                        first_seen_at,
+                        last_seen_at,
+                        window_start,
+                        window_end,
+                        updated_at
+                    FROM public.topic_rolling_24h
+                    """
+                )
 
         self._execute_write("ensure_stable_topic_read_model_tables", operation)
 
+    def reset_stable_topic_read_models(self) -> None:
+        def operation(connection: psycopg.Connection[Any]) -> None:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    TRUNCATE TABLE
+                        public.topic_rolling_24h,
+                        public.topic_day_series_5m,
+                        public.topic_day_totals,
+                        public.topic_buckets_1m_final,
+                        public.post_topic_mentions
+                    RESTART IDENTITY
+                    """
+                )
+                cursor.execute(
+                    """
+                    DELETE FROM public.topic_read_model_state WHERE id = 1
+                    """
+                )
+
+        self._execute_write("reset_stable_topic_read_models", operation)
+
     def sync_post_topic_mentions_from_post_topics(self, *, lookback_hours: int = 72) -> int:
         lookback_hours = max(1, int(lookback_hours))
+        weak_tokens = sorted(set(TOPIC_GENERIC_WEAK_TOKENS))
+        noise_tokens = sorted(set(TOPIC_NOISE_TOKENS))
+        number_tokens = sorted(set(TOPIC_NUMBER_WORD_TOKENS))
+        url_debris_tokens = sorted(set(TOPIC_URL_DEBRIS_TOKENS))
+        acronym_tokens = sorted(set(TOPIC_ACRONYM_ALLOWLIST))
 
         def operation(connection: psycopg.Connection[Any]) -> int:
             with connection.cursor() as cursor:
@@ -846,11 +1098,12 @@ class PostgresStore:
                     SELECT
                         to_regclass('public.post_topic_mentions'),
                         to_regclass('public.post_topics'),
-                        to_regclass('public.processed_posts')
+                        to_regclass('public.processed_posts'),
+                        to_regclass('public.topic_alias_rules')
                     """
                 )
-                tables = cursor.fetchone() or (None, None, None)
-                if not tables[0] or not tables[1]:
+                tables = cursor.fetchone() or (None, None, None, None)
+                if not tables[0] or not tables[1] or not tables[3]:
                     return 0
 
                 cursor.execute(
@@ -868,55 +1121,17 @@ class PostgresStore:
                                 )
                             ) AS sync_from
                     ),
-                    weak_topic_tokens(token) AS (
-                        VALUES
-                            ('a'), ('about'), ('after'), ('all'), ('also'), ('am'), ('an'), ('and'),
-                            ('any'), ('are'), ('as'), ('at'), ('be'), ('because'), ('been'), ('before'),
-                            ('being'), ('both'), ('but'), ('by'), ('can'), ('could'), ('day'), ('do'),
-                            ('does'), ('dont'), ('else'), ('ever'), ('every'), ('everyone'), ('first'),
-                            ('for'), ('from'), ('get'), ('got'), ('had'), ('has'), ('have'), ('here'),
-                            ('how'), ('i'), ('if'), ('ill'), ('im'), ('in'), ('into'), ('is'), ('it'),
-                            ('its'), ('ive'), ('just'), ('last'), ('like'), ('many'), ('may'), ('me'),
-                            ('might'), ('more'), ('most'), ('my'), ('need'), ('new'), ('no'), ('not'),
-                            ('now'), ('of'), ('oh'), ('ok'), ('on'), ('one'), ('only'), ('or'), ('our'),
-                            ('out'), ('over'), ('part'), ('please'), ('post'), ('read'), ('same'),
-                            ('see'), ('so'), ('some'), ('something'), ('still'), ('such'), ('that'),
-                            ('the'), ('their'), ('them'), ('then'), ('there'), ('these'), ('they'),
-                            ('this'), ('those'), ('through'), ('time'), ('to'), ('today'), ('tomorrow'),
-                            ('true'), ('very'), ('was'), ('we'), ('well'), ('were'), ('what'), ('when'),
-                            ('where'), ('which'), ('who'), ('why'), ('will'), ('with'), ('would'),
-                            ('yeah'), ('yes'), ('you'), ('your')
-                    ),
-                    topic_noise_tokens(token) AS (
-                        VALUES
-                            ('additional'), ('advisory'), ('afd'), ('airnow'), ('aqi'),
-                            ('details'), ('digit'), ('discussion'), ('forecast'),
-                            ('iembot'), ('issued'), ('prelim'), ('statement'), ('update')
-                    ),
-                    number_word_tokens(token) AS (
-                        VALUES
-                            ('zero'), ('one'), ('two'), ('three'), ('four'), ('five'), ('six'),
-                            ('seven'), ('eight'), ('nine'), ('ten'), ('eleven'), ('twelve'),
-                            ('thirteen'), ('fourteen'), ('fifteen'), ('sixteen'), ('seventeen'),
-                            ('eighteen'), ('nineteen'), ('twenty'), ('thirty'), ('forty'),
-                            ('fifty'), ('sixty'), ('seventy'), ('eighty'), ('ninety'),
-                            ('hundred'), ('thousand'), ('million'), ('billion'), ('trillion')
-                    ),
-                    acronym_allowlist(token) AS (
-                        VALUES
-                            ('btc'), ('djt'), ('eth'), ('eu'), ('fed'), ('gop'),
-                            ('nba'), ('nfl'), ('nft'), ('nyse'), ('sec'), ('uk'), ('usa'), ('xrp')
-                    ),
+                    weak_topic_tokens(token) AS (SELECT unnest(%s::text[])),
+                    topic_noise_tokens(token) AS (SELECT unnest(%s::text[])),
+                    number_word_tokens(token) AS (SELECT unnest(%s::text[])),
+                    url_debris_tokens(token) AS (SELECT unnest(%s::text[])),
+                    acronym_allowlist(token) AS (SELECT unnest(%s::text[])),
                     mention_candidates_raw AS (
                         SELECT
                             pt.raw_post_id,
                             pt.processed_post_id,
                             COALESCE(NULLIF(TRIM(pt.platform), ''), 'bluesky') AS platform,
-                            CASE
-                                WHEN normalized_topic_base IN ('nokings', 'no king', 'no kings', 'no kings s', 'no kingss')
-                                    THEN 'no kings'
-                                ELSE normalized_topic_base
-                            END AS normalized_topic,
+                            normalized_topic_base AS normalized_topic,
                             COALESCE(NULLIF(TRIM(pt.topic_text), ''), INITCAP(normalized_topic_base)) AS topic_text,
                             LOWER(COALESCE(NULLIF(TRIM(pt.topic_text), ''), '')) AS topic_text_lc,
                             COALESCE(
@@ -934,7 +1149,7 @@ class PostgresStore:
                                     THEN pp.sentiment_label
                                 ELSE 'neutral'
                             END AS sentiment_label,
-                            COALESCE(pp.quality_score, 0)::double precision AS quality_score,
+                            LEAST(1.0, GREATEST(0.0, COALESCE(pp.quality_score, 0)::double precision)) AS quality_score,
                             COALESCE(pp.is_repost, false) AS is_repost,
                             COALESCE(pp.is_reply, false) AS is_reply,
                             (COALESCE(array_length(pp.urls, 1), 0) > 0) AS has_link,
@@ -946,8 +1161,13 @@ class PostgresStore:
                                     BTRIM(
                                         REGEXP_REPLACE(
                                             REGEXP_REPLACE(
-                                                COALESCE(pt.normalized_topic, pt.topic_text, ''),
-                                                '[^a-zA-Z0-9$#\\s]+',
+                                                REGEXP_REPLACE(
+                                                    REPLACE(REPLACE(COALESCE(pt.normalized_topic, pt.topic_text, ''), 'â€™', ''''), '’', ''''),
+                                                    '([a-z0-9])''([a-z0-9])',
+                                                    '\\1\\2',
+                                                    'gi'
+                                                ),
+                                                '[^a-z0-9$#\\s-]+',
                                                 ' ',
                                                 'g'
                                             ),
@@ -964,72 +1184,171 @@ class PostgresStore:
                         LEFT JOIN public.processed_posts pp
                           ON pp.id = pt.processed_post_id
                     ),
+                    canonicalized AS (
+                        SELECT
+                            r.raw_post_id,
+                            r.processed_post_id,
+                            r.platform,
+                            COALESCE(a.canonical_key, r.normalized_topic) AS topic_key,
+                            COALESCE(
+                                a.canonical_label,
+                                CASE
+                                    WHEN r.normalized_topic IN (SELECT token FROM acronym_allowlist)
+                                        THEN UPPER(r.normalized_topic)
+                                    ELSE COALESCE(NULLIF(TRIM(r.topic_text), ''), INITCAP(r.normalized_topic))
+                                END
+                            ) AS topic_label,
+                            r.topic_text_lc,
+                            r.event_timestamp,
+                            r.ingested_at,
+                            r.author_id,
+                            r.sentiment_label,
+                            r.quality_score,
+                            COALESCE(a.confidence, 0.0)::double precision AS alias_confidence,
+                            r.is_repost,
+                            r.is_reply,
+                            r.has_link,
+                            r.topic_type
+                        FROM mention_candidates_raw r
+                        LEFT JOIN public.topic_alias_rules a
+                          ON a.alias_key = r.normalized_topic
+                         AND a.is_active = true
+                    ),
+                    scored AS (
+                        SELECT
+                            c.*,
+                            tok.token_count,
+                            tok.weak_count,
+                            tok.noise_count,
+                            tok.number_count,
+                            tok.url_count,
+                            tok.informative_count,
+                            LEAST(
+                                1.0,
+                                GREATEST(
+                                    0.0,
+                                    (
+                                        CASE c.topic_type
+                                            WHEN 'cashtag' THEN 0.74
+                                            WHEN 'hashtag' THEN 0.67
+                                            WHEN 'entity' THEN 0.56
+                                            ELSE 0.40
+                                        END
+                                        + (c.quality_score * 0.20)
+                                        + (c.alias_confidence * 0.18)
+                                        + CASE WHEN tok.token_count >= 2 THEN 0.12 ELSE 0 END
+                                        + CASE
+                                            WHEN c.topic_key IN (SELECT token FROM acronym_allowlist) THEN 0.12
+                                            ELSE 0
+                                          END
+                                        - ((tok.weak_count::double precision / NULLIF(tok.token_count, 0)) * 0.48)
+                                        - ((tok.noise_count::double precision / NULLIF(tok.token_count, 0)) * 0.70)
+                                        - ((tok.url_count::double precision / NULLIF(tok.token_count, 0)) * 1.00)
+                                        - CASE
+                                            WHEN tok.token_count = 1
+                                              AND c.topic_key NOT IN (SELECT token FROM acronym_allowlist)
+                                              AND LENGTH(c.topic_key) < 4
+                                                THEN 0.32
+                                            ELSE 0
+                                          END
+                                    )
+                                )
+                            ) AS topic_confidence
+                        FROM canonicalized c
+                        CROSS JOIN LATERAL (
+                            SELECT
+                                COALESCE(ARRAY_LENGTH(string_to_array(c.topic_key, ' '), 1), 0)::int AS token_count,
+                                COALESCE((
+                                    SELECT COUNT(*)
+                                    FROM unnest(string_to_array(c.topic_key, ' ')) AS t(token)
+                                    WHERE t.token IN (SELECT token FROM weak_topic_tokens)
+                                ), 0)::int AS weak_count,
+                                COALESCE((
+                                    SELECT COUNT(*)
+                                    FROM unnest(string_to_array(c.topic_key, ' ')) AS t(token)
+                                    WHERE t.token IN (SELECT token FROM topic_noise_tokens)
+                                ), 0)::int AS noise_count,
+                                COALESCE((
+                                    SELECT COUNT(*)
+                                    FROM unnest(string_to_array(c.topic_key, ' ')) AS t(token)
+                                    WHERE t.token IN (SELECT token FROM number_word_tokens)
+                                ), 0)::int AS number_count,
+                                COALESCE((
+                                    SELECT COUNT(*)
+                                    FROM unnest(string_to_array(c.topic_key, ' ')) AS t(token)
+                                    WHERE t.token IN (SELECT token FROM url_debris_tokens)
+                                ), 0)::int AS url_count,
+                                COALESCE((
+                                    SELECT COUNT(*)
+                                    FROM unnest(string_to_array(c.topic_key, ' ')) AS t(token)
+                                    WHERE t.token <> ''
+                                      AND t.token NOT IN (SELECT token FROM weak_topic_tokens)
+                                      AND t.token NOT IN (SELECT token FROM topic_noise_tokens)
+                                      AND t.token NOT IN (SELECT token FROM number_word_tokens)
+                                      AND t.token NOT IN (SELECT token FROM url_debris_tokens)
+                                      AND (
+                                          LENGTH(t.token) >= 4
+                                          OR t.token IN (SELECT token FROM acronym_allowlist)
+                                      )
+                                ), 0)::int AS informative_count
+                        ) tok
+                    ),
                     mention_candidates AS (
                         SELECT
                             *
-                        FROM mention_candidates_raw
-                        WHERE normalized_topic <> ''
-                          AND normalized_topic NOT IN ('all', 'general', 'digit')
+                        FROM scored
+                        WHERE topic_key <> ''
+                          AND topic_key NOT IN ('all', 'general', 'digit')
                           AND NOT (topic_text_lc LIKE 'digit:%%in words:%%')
-                          AND length(replace(normalized_topic, ' ', '')) >= 2
-                          AND array_length(string_to_array(normalized_topic, ' '), 1) BETWEEN 1 AND 5
-                          AND normalized_topic !~ '^[0-9]+$'
-                          AND normalized_topic !~* '(^| )([a-z0-9]+bot)( |$)'
-                          AND normalized_topic !~* '(area|forecast|discussion).*(afd|airnow|aqi)'
-                          AND normalized_topic !~* '(additional|details) here'
+                          AND length(replace(topic_key, ' ', '')) >= 2
+                          AND token_count BETWEEN 1 AND 5
+                          AND topic_key !~ '^[0-9]+$'
+                          AND topic_key !~* '(^| )(https?|www|com|co|t|ly|amp)( |$)'
+                          AND topic_key !~* '(^| )([a-z0-9]+bot)( |$)'
+                          AND topic_key !~* '(area|forecast|discussion).*(afd|airnow|aqi)'
+                          AND topic_key !~* '(additional|details) here'
                           AND (
-                              array_length(string_to_array(normalized_topic, ' '), 1) > 1
+                              token_count > 1
                               OR (
-                                  normalized_topic NOT IN (SELECT token FROM weak_topic_tokens)
-                                  AND normalized_topic NOT IN (SELECT token FROM topic_noise_tokens)
-                                  AND normalized_topic NOT IN (SELECT token FROM number_word_tokens)
+                                  topic_key NOT IN (SELECT token FROM weak_topic_tokens)
+                                  AND topic_key NOT IN (SELECT token FROM topic_noise_tokens)
+                                  AND topic_key NOT IN (SELECT token FROM number_word_tokens)
+                                  AND topic_key NOT IN (SELECT token FROM url_debris_tokens)
                                   AND (
-                                      length(normalized_topic) >= 4
-                                      OR normalized_topic IN (SELECT token FROM acronym_allowlist)
+                                      length(topic_key) >= 4
+                                      OR topic_key IN (SELECT token FROM acronym_allowlist)
                                       OR topic_type IN ('cashtag', 'hashtag')
                                   )
                               )
                           )
-                          AND (
-                              SELECT COUNT(*)
-                              FROM unnest(string_to_array(normalized_topic, ' ')) AS t(token)
-                              WHERE token <> ''
-                                AND token IN (SELECT token FROM number_word_tokens)
-                          ) < array_length(string_to_array(normalized_topic, ' '), 1)
-                          AND EXISTS (
-                              SELECT 1
-                              FROM unnest(string_to_array(normalized_topic, ' ')) AS t(token)
-                              WHERE t.token <> ''
-                                AND t.token NOT IN (SELECT token FROM weak_topic_tokens)
-                                AND t.token NOT IN (SELECT token FROM topic_noise_tokens)
-                                AND t.token NOT IN (SELECT token FROM number_word_tokens)
-                                AND (
-                                    length(t.token) >= 4
-                                    OR t.token IN (SELECT token FROM acronym_allowlist)
-                                    OR topic_type IN ('cashtag', 'hashtag')
-                                )
-                          )
+                          AND number_count < token_count
+                          AND informative_count > 0
+                          AND url_count = 0
+                          AND topic_confidence >= CASE
+                              WHEN topic_type = 'cashtag' THEN 0.34
+                              WHEN topic_type = 'hashtag' THEN 0.38
+                              WHEN topic_type = 'entity' THEN 0.45
+                              ELSE 0.62
+                          END
                     ),
                     deduped AS (
-                        SELECT DISTINCT ON (raw_post_id, platform, normalized_topic)
+                        SELECT DISTINCT ON (raw_post_id, platform, topic_key)
                             raw_post_id,
                             processed_post_id,
                             platform,
-                            normalized_topic AS topic_key,
-                            CASE
-                                WHEN normalized_topic = 'no kings' THEN 'No Kings'
-                                ELSE COALESCE(NULLIF(TRIM(topic_text), ''), INITCAP(normalized_topic))
-                            END AS topic_label,
+                            topic_key,
+                            topic_label,
                             event_timestamp,
                             ingested_at,
                             author_id,
                             sentiment_label,
                             quality_score,
+                            topic_confidence,
                             is_repost,
                             is_reply,
                             has_link
                         FROM mention_candidates
-                        ORDER BY raw_post_id, platform, normalized_topic, quality_score DESC, event_timestamp DESC
+                        ORDER BY raw_post_id, platform, topic_key, topic_confidence DESC, quality_score DESC, event_timestamp DESC
                     )
                     INSERT INTO public.post_topic_mentions (
                         raw_post_id,
@@ -1042,6 +1361,7 @@ class PostgresStore:
                         author_id,
                         sentiment_label,
                         quality_score,
+                        topic_confidence,
                         is_repost,
                         is_reply,
                         has_link
@@ -1057,6 +1377,7 @@ class PostgresStore:
                         author_id,
                         sentiment_label,
                         quality_score,
+                        topic_confidence,
                         is_repost,
                         is_reply,
                         has_link
@@ -1069,12 +1390,21 @@ class PostgresStore:
                         author_id = COALESCE(EXCLUDED.author_id, public.post_topic_mentions.author_id),
                         sentiment_label = EXCLUDED.sentiment_label,
                         quality_score = EXCLUDED.quality_score,
+                        topic_confidence = GREATEST(public.post_topic_mentions.topic_confidence, EXCLUDED.topic_confidence),
                         is_repost = EXCLUDED.is_repost,
                         is_reply = EXCLUDED.is_reply,
                         has_link = EXCLUDED.has_link
                     """
                     ,
-                    (lookback_hours, lookback_hours),
+                    (
+                        lookback_hours,
+                        lookback_hours,
+                        weak_tokens,
+                        noise_tokens,
+                        number_tokens,
+                        url_debris_tokens,
+                        acronym_tokens,
+                    ),
                 )
                 return int(cursor.rowcount or 0)
 
@@ -1114,6 +1444,7 @@ class PostgresStore:
                     positive_count,
                     neutral_count,
                     negative_count,
+                    avg_topic_confidence,
                     first_seen_at,
                     last_seen_at,
                     updated_at
@@ -1129,6 +1460,12 @@ class PostgresStore:
                     SUM(b.positive_count)::int AS positive_count,
                     SUM(b.neutral_count)::int AS neutral_count,
                     SUM(b.negative_count)::int AS negative_count,
+                    CASE
+                        WHEN SUM(b.mention_count) > 0
+                            THEN SUM(b.avg_topic_confidence * b.mention_count)::double precision
+                                 / SUM(b.mention_count)::double precision
+                        ELSE 0::double precision
+                    END AS avg_topic_confidence,
                     MIN(b.bucket_minute) AS first_seen_at,
                     MAX(b.bucket_minute) AS last_seen_at,
                     now() AS updated_at
@@ -1232,6 +1569,55 @@ class PostgresStore:
             )
             return int(cursor.rowcount or 0)
 
+        def refresh_rolling_24h(cursor: Any, *, window_start: datetime, window_end: datetime) -> int:
+            cursor.execute("DELETE FROM public.topic_rolling_24h")
+            cursor.execute(
+                """
+                INSERT INTO public.topic_rolling_24h (
+                    topic_key,
+                    topic_label,
+                    platform_count,
+                    total_mentions,
+                    unique_posts,
+                    unique_authors,
+                    positive_count,
+                    neutral_count,
+                    negative_count,
+                    avg_topic_confidence,
+                    first_seen_at,
+                    last_seen_at,
+                    window_start,
+                    window_end,
+                    updated_at
+                )
+                SELECT
+                    m.topic_key,
+                    COALESCE(t.canonical_label, MAX(NULLIF(TRIM(m.topic_label), '')), INITCAP(m.topic_key)) AS topic_label,
+                    COUNT(DISTINCT m.platform)::int AS platform_count,
+                    COUNT(*)::int AS total_mentions,
+                    COUNT(DISTINCT m.raw_post_id)::int AS unique_posts,
+                    COUNT(DISTINCT NULLIF(m.author_id, ''))::int AS unique_authors,
+                    SUM(CASE WHEN m.sentiment_label = 'positive' THEN 1 ELSE 0 END)::int AS positive_count,
+                    SUM(CASE WHEN m.sentiment_label = 'neutral' THEN 1 ELSE 0 END)::int AS neutral_count,
+                    SUM(CASE WHEN m.sentiment_label = 'negative' THEN 1 ELSE 0 END)::int AS negative_count,
+                    AVG(COALESCE(m.topic_confidence, 0))::double precision AS avg_topic_confidence,
+                    MIN(m.event_timestamp) AS first_seen_at,
+                    MAX(m.event_timestamp) AS last_seen_at,
+                    %s::timestamptz AS window_start,
+                    %s::timestamptz AS window_end,
+                    now() AS updated_at
+                FROM public.post_topic_mentions m
+                LEFT JOIN public.topics t
+                  ON t.topic_key = m.topic_key
+                WHERE m.event_timestamp >= %s::timestamptz
+                  AND m.event_timestamp < %s::timestamptz
+                  AND COALESCE(m.topic_confidence, 0) >= 0.34
+                GROUP BY m.topic_key, t.canonical_label
+                """,
+                (window_start, window_end, window_start, window_end),
+            )
+            return int(cursor.rowcount or 0)
+
         def operation(connection: psycopg.Connection[Any]) -> dict[str, Any]:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1240,10 +1626,12 @@ class PostgresStore:
                         to_regclass('public.post_topic_mentions'),
                         to_regclass('public.topic_buckets_1m_final'),
                         to_regclass('public.topic_day_totals'),
-                        to_regclass('public.topic_day_series_5m')
+                        to_regclass('public.topic_day_series_5m'),
+                        to_regclass('public.topic_rolling_24h'),
+                        to_regclass('public.topic_read_model_state')
                     """
                 )
-                tables = cursor.fetchone() or (None, None, None, None)
+                tables = cursor.fetchone() or (None, None, None, None, None, None)
                 if not all(tables):
                     return {
                         "skipped": True,
@@ -1253,76 +1641,106 @@ class PostgresStore:
 
                 cursor.execute(
                     """
-                    WITH bounds AS (
+                    WITH computed AS (
                         SELECT
                             date_trunc('minute', now() - make_interval(mins => %s)) AS finalize_before,
-                            date_trunc('minute', now() - make_interval(hours => %s)) AS recompute_from
+                            date_trunc('minute', now() - make_interval(hours => %s)) AS hard_recompute_from,
+                            (
+                                SELECT last_finalize_before
+                                FROM public.topic_read_model_state
+                                WHERE id = 1
+                            ) AS last_finalize_before
                     ),
-                    deleted AS (
-                        DELETE FROM public.topic_buckets_1m_final t
-                        USING bounds b
-                        WHERE t.bucket_minute >= b.recompute_from
-                          AND t.bucket_minute < b.finalize_before
-                        RETURNING 1
-                    ),
-                    aggregated AS (
+                    bounded AS (
                         SELECT
-                            date_trunc('minute', m.event_timestamp) AS bucket_minute,
-                            m.platform,
-                            m.topic_key,
-                            COUNT(*)::int AS mention_count,
-                            COUNT(DISTINCT m.raw_post_id)::int AS unique_posts,
-                            COUNT(DISTINCT NULLIF(m.author_id, ''))::int AS unique_authors,
-                            SUM(CASE WHEN m.sentiment_label = 'positive' THEN 1 ELSE 0 END)::int AS positive_count,
-                            SUM(CASE WHEN m.sentiment_label = 'neutral' THEN 1 ELSE 0 END)::int AS neutral_count,
-                            SUM(CASE WHEN m.sentiment_label = 'negative' THEN 1 ELSE 0 END)::int AS negative_count
-                        FROM public.post_topic_mentions m
-                        JOIN bounds b
-                          ON date_trunc('minute', m.event_timestamp) >= b.recompute_from
-                         AND date_trunc('minute', m.event_timestamp) < b.finalize_before
-                        GROUP BY 1, 2, 3
-                    ),
-                    upserted AS (
-                        INSERT INTO public.topic_buckets_1m_final (
-                            bucket_minute,
-                            platform,
-                            topic_key,
-                            mention_count,
-                            unique_posts,
-                            unique_authors,
-                            positive_count,
-                            neutral_count,
-                            negative_count,
-                            finalized_at
-                        )
-                        SELECT
-                            bucket_minute,
-                            platform,
-                            topic_key,
-                            mention_count,
-                            unique_posts,
-                            unique_authors,
-                            positive_count,
-                            neutral_count,
-                            negative_count,
-                            now() AS finalized_at
-                        FROM aggregated
-                        ON CONFLICT (bucket_minute, platform, topic_key) DO UPDATE
-                        SET mention_count = EXCLUDED.mention_count,
-                            unique_posts = EXCLUDED.unique_posts,
-                            unique_authors = EXCLUDED.unique_authors,
-                            positive_count = EXCLUDED.positive_count,
-                            neutral_count = EXCLUDED.neutral_count,
-                            negative_count = EXCLUDED.negative_count,
-                            finalized_at = EXCLUDED.finalized_at
-                        RETURNING 1
+                            finalize_before,
+                            GREATEST(
+                                hard_recompute_from,
+                                COALESCE(last_finalize_before - interval '45 minute', hard_recompute_from)
+                            ) AS recompute_from
+                        FROM computed
                     )
-                    SELECT COUNT(*)::bigint
-                    FROM upserted
+                    SELECT finalize_before, recompute_from
+                    FROM bounded
                     """,
                     (lag_minutes, recompute_hours),
                 )
-                finalized_rows = int((cursor.fetchone() or [0])[0] or 0)
+                bounds_row = cursor.fetchone() or (None, None)
+                finalize_before = bounds_row[0]
+                recompute_from = bounds_row[1]
+                if not isinstance(finalize_before, datetime) or not isinstance(recompute_from, datetime):
+                    return {
+                        "skipped": True,
+                        "reason": "missing_refresh_bounds",
+                        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                if recompute_from >= finalize_before:
+                    recompute_from = finalize_before - timedelta(minutes=1)
+
+                cursor.execute(
+                    """
+                    DELETE FROM public.topic_buckets_1m_final
+                    WHERE bucket_minute >= %s::timestamptz
+                      AND bucket_minute < %s::timestamptz
+                    """,
+                    (recompute_from, finalize_before),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO public.topic_buckets_1m_final (
+                        bucket_minute,
+                        platform,
+                        topic_key,
+                        mention_count,
+                        unique_posts,
+                        unique_authors,
+                        positive_count,
+                        neutral_count,
+                        negative_count,
+                        avg_topic_confidence,
+                        finalized_at
+                    )
+                    SELECT
+                        date_trunc('minute', m.event_timestamp) AS bucket_minute,
+                        m.platform,
+                        m.topic_key,
+                        COUNT(*)::int AS mention_count,
+                        COUNT(DISTINCT m.raw_post_id)::int AS unique_posts,
+                        COUNT(DISTINCT NULLIF(m.author_id, ''))::int AS unique_authors,
+                        SUM(CASE WHEN m.sentiment_label = 'positive' THEN 1 ELSE 0 END)::int AS positive_count,
+                        SUM(CASE WHEN m.sentiment_label = 'neutral' THEN 1 ELSE 0 END)::int AS neutral_count,
+                        SUM(CASE WHEN m.sentiment_label = 'negative' THEN 1 ELSE 0 END)::int AS negative_count,
+                        AVG(COALESCE(m.topic_confidence, 0))::double precision AS avg_topic_confidence,
+                        now() AS finalized_at
+                    FROM public.post_topic_mentions m
+                    WHERE date_trunc('minute', m.event_timestamp) >= %s::timestamptz
+                      AND date_trunc('minute', m.event_timestamp) < %s::timestamptz
+                      AND COALESCE(m.topic_confidence, 0) >= 0.34
+                    GROUP BY 1, 2, 3
+                    ON CONFLICT (bucket_minute, platform, topic_key) DO UPDATE
+                    SET mention_count = EXCLUDED.mention_count,
+                        unique_posts = EXCLUDED.unique_posts,
+                        unique_authors = EXCLUDED.unique_authors,
+                        positive_count = EXCLUDED.positive_count,
+                        neutral_count = EXCLUDED.neutral_count,
+                        negative_count = EXCLUDED.negative_count,
+                        avg_topic_confidence = EXCLUDED.avg_topic_confidence,
+                        finalized_at = EXCLUDED.finalized_at
+                    """,
+                    (recompute_from, finalize_before),
+                )
+                finalized_rows = int(cursor.rowcount or 0)
+
+                cursor.execute(
+                    """
+                    INSERT INTO public.topic_read_model_state (id, last_finalize_before, updated_at)
+                    VALUES (1, %s::timestamptz, now())
+                    ON CONFLICT (id) DO UPDATE
+                    SET last_finalize_before = EXCLUDED.last_finalize_before,
+                        updated_at = now()
+                    """,
+                    (finalize_before,),
+                )
 
                 today_utc = datetime.now(timezone.utc).date()
                 yesterday_utc = today_utc - timedelta(days=1)
@@ -1330,6 +1748,13 @@ class PostgresStore:
                 totals_yesterday = refresh_day_totals(cursor, yesterday_utc)
                 series_today = refresh_day_series(cursor, today_utc)
                 series_yesterday = refresh_day_series(cursor, yesterday_utc)
+                rolling_window_end = finalize_before
+                rolling_window_start = rolling_window_end - timedelta(hours=24)
+                rolling_rows = refresh_rolling_24h(
+                    cursor,
+                    window_start=rolling_window_start,
+                    window_end=rolling_window_end,
+                )
 
                 return {
                     "finalized_bucket_rows": finalized_rows,
@@ -1337,6 +1762,9 @@ class PostgresStore:
                     "day_totals_yesterday_rows": totals_yesterday,
                     "day_series_today_rows": series_today,
                     "day_series_yesterday_rows": series_yesterday,
+                    "rolling_24h_rows": rolling_rows,
+                    "rolling_window_start": rolling_window_start.isoformat(),
+                    "rolling_window_end": rolling_window_end.isoformat(),
                     "refreshed_at": datetime.now(timezone.utc).isoformat(),
                 }
 
@@ -1344,6 +1772,11 @@ class PostgresStore:
 
     def cleanup_garbage_post_topic_mentions(self, *, lookback_hours: int = 168) -> int:
         lookback_hours = max(1, int(lookback_hours))
+        weak_tokens = sorted(set(TOPIC_GENERIC_WEAK_TOKENS))
+        noise_tokens = sorted(set(TOPIC_NOISE_TOKENS))
+        number_tokens = sorted(set(TOPIC_NUMBER_WORD_TOKENS))
+        url_debris_tokens = sorted(set(TOPIC_URL_DEBRIS_TOKENS))
+        acronym_tokens = sorted(set(TOPIC_ACRONYM_ALLOWLIST))
 
         def operation(connection: psycopg.Connection[Any]) -> int:
             with connection.cursor() as cursor:
@@ -1354,45 +1787,11 @@ class PostgresStore:
 
                 cursor.execute(
                     """
-                    WITH weak_topic_tokens(token) AS (
-                        VALUES
-                            ('a'), ('about'), ('after'), ('all'), ('also'), ('am'), ('an'), ('and'),
-                            ('any'), ('are'), ('as'), ('at'), ('be'), ('because'), ('been'), ('before'),
-                            ('being'), ('both'), ('but'), ('by'), ('can'), ('could'), ('day'), ('do'),
-                            ('does'), ('dont'), ('else'), ('ever'), ('every'), ('everyone'), ('first'),
-                            ('for'), ('from'), ('get'), ('got'), ('had'), ('has'), ('have'), ('here'),
-                            ('how'), ('i'), ('if'), ('ill'), ('im'), ('in'), ('into'), ('is'), ('it'),
-                            ('its'), ('ive'), ('just'), ('last'), ('like'), ('many'), ('may'), ('me'),
-                            ('might'), ('more'), ('most'), ('my'), ('need'), ('new'), ('no'), ('not'),
-                            ('now'), ('of'), ('oh'), ('ok'), ('on'), ('one'), ('only'), ('or'), ('our'),
-                            ('out'), ('over'), ('part'), ('please'), ('post'), ('read'), ('same'),
-                            ('see'), ('so'), ('some'), ('something'), ('still'), ('such'), ('that'),
-                            ('the'), ('their'), ('them'), ('then'), ('there'), ('these'), ('they'),
-                            ('this'), ('those'), ('through'), ('time'), ('to'), ('today'), ('tomorrow'),
-                            ('true'), ('very'), ('was'), ('we'), ('well'), ('were'), ('what'), ('when'),
-                            ('where'), ('which'), ('who'), ('why'), ('will'), ('with'), ('would'),
-                            ('yeah'), ('yes'), ('you'), ('your')
-                    ),
-                    topic_noise_tokens(token) AS (
-                        VALUES
-                            ('additional'), ('advisory'), ('afd'), ('airnow'), ('aqi'),
-                            ('details'), ('digit'), ('discussion'), ('forecast'),
-                            ('iembot'), ('issued'), ('prelim'), ('statement'), ('update')
-                    ),
-                    number_word_tokens(token) AS (
-                        VALUES
-                            ('zero'), ('one'), ('two'), ('three'), ('four'), ('five'), ('six'),
-                            ('seven'), ('eight'), ('nine'), ('ten'), ('eleven'), ('twelve'),
-                            ('thirteen'), ('fourteen'), ('fifteen'), ('sixteen'), ('seventeen'),
-                            ('eighteen'), ('nineteen'), ('twenty'), ('thirty'), ('forty'),
-                            ('fifty'), ('sixty'), ('seventy'), ('eighty'), ('ninety'),
-                            ('hundred'), ('thousand'), ('million'), ('billion'), ('trillion')
-                    ),
-                    acronym_allowlist(token) AS (
-                        VALUES
-                            ('btc'), ('djt'), ('eth'), ('eu'), ('fed'), ('gop'),
-                            ('nba'), ('nfl'), ('nft'), ('nyse'), ('sec'), ('uk'), ('usa'), ('xrp')
-                    ),
+                    WITH weak_topic_tokens(token) AS (SELECT unnest(%s::text[])),
+                    topic_noise_tokens(token) AS (SELECT unnest(%s::text[])),
+                    number_word_tokens(token) AS (SELECT unnest(%s::text[])),
+                    url_debris_tokens(token) AS (SELECT unnest(%s::text[])),
+                    acronym_allowlist(token) AS (SELECT unnest(%s::text[])),
                     bad_mentions AS (
                         SELECT m.mention_id
                         FROM public.post_topic_mentions m
@@ -1400,7 +1799,9 @@ class PostgresStore:
                           AND (
                               COALESCE(TRIM(m.topic_key), '') = ''
                               OR LOWER(m.topic_key) IN ('all', 'general', 'digit')
+                              OR COALESCE(m.topic_confidence, 0) < 0.20
                               OR LOWER(m.topic_key) ~* '(^| )([a-z0-9]+bot)( |$)'
+                              OR LOWER(m.topic_key) ~* '(^| )(https?|www|com|co|t|ly|amp)( |$)'
                               OR LOWER(m.topic_key) ~* '(area|forecast|discussion).*(afd|airnow|aqi)'
                               OR LOWER(m.topic_key) ~* '(additional|details) here'
                               OR (
@@ -1409,6 +1810,7 @@ class PostgresStore:
                                       LOWER(m.topic_key) IN (SELECT token FROM weak_topic_tokens)
                                       OR LOWER(m.topic_key) IN (SELECT token FROM topic_noise_tokens)
                                       OR LOWER(m.topic_key) IN (SELECT token FROM number_word_tokens)
+                                      OR LOWER(m.topic_key) IN (SELECT token FROM url_debris_tokens)
                                   )
                               )
                               OR (
@@ -1429,6 +1831,7 @@ class PostgresStore:
                                         AND t.token NOT IN (SELECT token FROM weak_topic_tokens)
                                         AND t.token NOT IN (SELECT token FROM topic_noise_tokens)
                                         AND t.token NOT IN (SELECT token FROM number_word_tokens)
+                                        AND t.token NOT IN (SELECT token FROM url_debris_tokens)
                                         AND (
                                             length(t.token) >= 4
                                             OR t.token IN (SELECT token FROM acronym_allowlist)
@@ -1441,7 +1844,14 @@ class PostgresStore:
                     USING bad_mentions b
                     WHERE m.mention_id = b.mention_id
                     """,
-                    (lookback_hours,),
+                    (
+                        weak_tokens,
+                        noise_tokens,
+                        number_tokens,
+                        url_debris_tokens,
+                        acronym_tokens,
+                        lookback_hours,
+                    ),
                 )
                 return int(cursor.rowcount or 0)
 
