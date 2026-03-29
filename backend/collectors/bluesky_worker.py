@@ -8,6 +8,17 @@ from typing import Any, Dict, Iterable, List
 from urllib.parse import urlparse
 
 from backend.bluesky_firehose import sync_bluesky_firehose
+from backend.topic_rules import (
+    CANONICAL_TOPIC_RULES,
+    TOPIC_ACRONYM_ALLOWLIST,
+    TOPIC_ENTITY_ALLOWLIST,
+    TOPIC_GENERIC_WEAK_TOKENS,
+    TOPIC_URL_DEBRIS_TOKENS,
+    build_topic_alias_lookup,
+    canonicalize_topic_key,
+    normalize_topic_key_text,
+    score_topic_candidate,
+)
 
 PLATFORM = "bluesky"
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
@@ -100,6 +111,7 @@ TOPIC_ACRONYM_EXCEPTIONS = {
     "usa",
     "xrp",
 }
+TOPIC_ACRONYM_EXCEPTIONS = TOPIC_ACRONYM_EXCEPTIONS.union(TOPIC_ACRONYM_ALLOWLIST)
 
 TOPIC_NOISE_TOKENS = {
     "additional",
@@ -116,6 +128,7 @@ TOPIC_NOISE_TOKENS = {
     "statement",
     "update",
 }
+TOPIC_NOISE_TOKENS = TOPIC_NOISE_TOKENS.union(TOPIC_URL_DEBRIS_TOKENS)
 
 TOPIC_GARBAGE_PHRASE_PATTERNS = (
     re.compile(r"\b(?:area|forecast|discussion)\b.*\b(?:afd|airnow|aqi)\b", re.IGNORECASE),
@@ -440,13 +453,11 @@ WEAK_TOPIC_TOKENS = {
     "you",
     "your",
 }
+WEAK_TOPIC_TOKENS = WEAK_TOPIC_TOKENS.union(TOPIC_GENERIC_WEAK_TOKENS)
 
 TOPIC_CANONICAL_ALIASES = {
-    "nokings": "No Kings",
-    "no king": "No Kings",
-    "no kings": "No Kings",
-    "no kingss": "No Kings",
-    "no kings's": "No Kings",
+    alias_key: rule.canonical_label
+    for alias_key, rule in build_topic_alias_lookup(CANONICAL_TOPIC_RULES).items()
 }
 
 CRYPTO_TERMS = {
@@ -652,6 +663,8 @@ def _extract_tokens(text: str) -> List[str]:
             continue
         if token in STOPWORD_TOKENS:
             continue
+        if token in TOPIC_URL_DEBRIS_TOKENS:
+            continue
         tokens.append(token)
     return _dedupe_text(tokens)
 
@@ -678,12 +691,18 @@ def _extract_domains(urls: Iterable[str]) -> List[str]:
 
 def _normalize_topic_text(value: str) -> str:
     candidate = _normalize_whitespace(str(value or ""))
+    candidate = re.sub(r"[`\u2019\u2018\u00b4\u02bc\u02b9]", "'", candidate)
+    candidate = re.sub(r"(?<=\w)[?\uFFFD](?=\w)", "", candidate)
+    candidate = re.sub(r"(?<=\w)'(?=\w)", "", candidate)
+    candidate = candidate.replace("'", "")
     candidate = candidate.strip("`~!%^*()[]{}<>:;\",.?/\\|")
+    candidate = re.sub(r"\s+", " ", candidate).strip()
     return candidate
 
 
 def _topic_tokens(value: str) -> list[str]:
-    return [token for token in re.findall(r"[a-z0-9]+", str(value or "").lower()) if token]
+    normalized = normalize_topic_key_text(str(value or ""))
+    return [token for token in re.findall(r"[a-z0-9$#]+", normalized) if token]
 
 
 def _is_acronym_like_token(value: str) -> bool:
@@ -711,13 +730,19 @@ def _is_garbage_topic_phrase(value: str, *, topic_type: str) -> bool:
     noise_count = sum(1 for token in tokens if token in TOPIC_NOISE_TOKENS)
     weak_count = sum(1 for token in tokens if token in WEAK_TOPIC_TOKENS)
     number_word_count = sum(1 for token in tokens if token in TOPIC_NUMBER_WORD_TOKENS)
+    url_debris_count = sum(1 for token in tokens if token in TOPIC_URL_DEBRIS_TOKENS)
     informative_count = sum(
         1
         for token in tokens
         if token not in WEAK_TOPIC_TOKENS
         and token not in TOPIC_NOISE_TOKENS
         and token not in TOPIC_NUMBER_WORD_TOKENS
-        and (len(token) >= 4 or token in TOPIC_ACRONYM_EXCEPTIONS)
+        and token not in TOPIC_URL_DEBRIS_TOKENS
+        and (
+            len(token) >= 4
+            or token in TOPIC_ACRONYM_EXCEPTIONS
+            or token in TOPIC_ENTITY_ALLOWLIST
+        )
     )
 
     if len(tokens) == 1 and tokens[0] in TOPIC_NOISE_TOKENS:
@@ -727,6 +752,8 @@ def _is_garbage_topic_phrase(value: str, *, topic_type: str) -> bool:
     if number_word_count == len(tokens):
         return True
     if topic_type in {"entity", "keyword"} and len(tokens) >= 2 and number_word_count >= (len(tokens) - 1):
+        return True
+    if url_debris_count > 0:
         return True
     if noise_count >= max(2, len(tokens) - 1):
         return True
@@ -745,17 +772,24 @@ def _is_high_signal_keyword_token(value: str) -> bool:
     token = str(value or "").strip().lower()
     if not token:
         return False
+    if token in TOPIC_URL_DEBRIS_TOKENS:
+        return False
     if token in STOPWORD_TOKENS or token in TOPIC_BLOCKLIST:
         return False
     if token in WEAK_TOPIC_TOKENS or token in TOPIC_NOISE_TOKENS:
         return False
     if token in TOPIC_NUMBER_WORD_TOKENS:
         return False
-    if len(token) < 4:
+    if token in TOPIC_ENTITY_ALLOWLIST:
+        return True
+    if token in TOPIC_ACRONYM_EXCEPTIONS:
+        return True
+    if len(token) < 5:
         return False
     if token.isdigit():
         return False
-    return True
+    confidence = score_topic_candidate(topic_key=token, topic_type="keyword")
+    return confidence >= 0.62
 
 
 def _is_weak_topic_phrase(value: str, *, topic_type: str) -> bool:
@@ -775,6 +809,8 @@ def _is_weak_topic_phrase(value: str, *, topic_type: str) -> bool:
     if len(tokens) == 1:
         token = tokens[0]
         if token in WEAK_TOPIC_TOKENS or token in TOPIC_NOISE_TOKENS:
+            return True
+        if token in TOPIC_URL_DEBRIS_TOKENS:
             return True
         if token in TOPIC_NUMBER_WORD_TOKENS:
             return True
@@ -797,7 +833,11 @@ def _is_weak_topic_phrase(value: str, *, topic_type: str) -> bool:
         for token in tokens
         if token not in WEAK_TOPIC_TOKENS
         and token not in TOPIC_NOISE_TOKENS
-        and (len(token) >= 4 or token in TOPIC_ACRONYM_EXCEPTIONS)
+        and (
+            len(token) >= 4
+            or token in TOPIC_ACRONYM_EXCEPTIONS
+            or token in TOPIC_ENTITY_ALLOWLIST
+        )
     )
 
     if weak_count == len(tokens):
@@ -820,9 +860,13 @@ def _normalize_topic_value(value: str, *, topic_type: str) -> str:
     if topic_type == "cashtag":
         return candidate.removeprefix("$").upper()
     if topic_type == "hashtag":
-        hashtag_topic = candidate.removeprefix("#").lower()
-        alias = TOPIC_CANONICAL_ALIASES.get(hashtag_topic.replace("’", "'"))
-        return alias or hashtag_topic
+        hashtag_topic = normalize_topic_key_text(candidate.removeprefix("#"))
+        alias = TOPIC_CANONICAL_ALIASES.get(hashtag_topic)
+        if alias:
+            return alias
+        if hashtag_topic in TOPIC_ACRONYM_EXCEPTIONS:
+            return hashtag_topic.upper()
+        return hashtag_topic
 
     words = candidate.split(" ")
     normalized_words: list[str] = []
@@ -830,9 +874,11 @@ def _normalize_topic_value(value: str, *, topic_type: str) -> str:
         token = str(word or "").strip()
         if not token:
             continue
+        token = re.sub(r"(?<=\w)'(?=\w)", "", token.replace("â€™", "'"))
+        token = token.replace("'", "")
         cleaned = token[:-2] if token.lower().endswith("'s") and len(token) > 3 else token
         if cleaned.lower() in TOPIC_CONNECTOR_WORDS:
-            normalized_words.append(token.lower())
+            normalized_words.append(cleaned.lower())
             continue
         if cleaned.isupper() and 2 <= len(cleaned) <= 10:
             normalized_words.append(cleaned)
@@ -852,10 +898,15 @@ def _normalize_topic_value(value: str, *, topic_type: str) -> str:
         normalized_words.append(cleaned[:1].upper() + cleaned[1:].lower())
 
     normalized = " ".join(normalized_words).strip()
-    normalized_lookup = normalized.lower().replace("’", "'")
+    normalized_lookup = normalize_topic_key_text(normalized)
     alias = TOPIC_CANONICAL_ALIASES.get(normalized_lookup)
     if alias:
         return alias
+    canonical_key, canonical_label, _ = canonicalize_topic_key(normalized_lookup)
+    if canonical_key and canonical_key != normalized_lookup and canonical_label:
+        return canonical_label
+    if normalized_lookup in TOPIC_ACRONYM_EXCEPTIONS:
+        return normalized_lookup.upper()
     return normalized
 
 
@@ -865,7 +916,7 @@ def _is_valid_topic_candidate(value: str, *, topic_type: str) -> bool:
         return False
 
     normalized = _normalize_topic_value(candidate, topic_type=topic_type)
-    normalized_lower = normalized.lower()
+    normalized_lower = normalize_topic_key_text(normalized)
     tokens = _topic_tokens(normalized)
 
     if not normalized:
@@ -876,13 +927,17 @@ def _is_valid_topic_candidate(value: str, *, topic_type: str) -> bool:
         return False
     if len(tokens) > 5:
         return False
-    if normalized.isdigit():
+    if normalized_lower.isdigit():
         return False
     if normalized_lower in TOPIC_BLOCKLIST:
+        return False
+    if normalized_lower in TOPIC_URL_DEBRIS_TOKENS:
         return False
     if len(tokens) == 1 and tokens[0] in TOPIC_NUMBER_WORD_TOKENS:
         return False
     if len(tokens) == 1 and tokens[0] in TOPIC_NOISE_TOKENS:
+        return False
+    if len(tokens) == 1 and tokens[0] in TOPIC_URL_DEBRIS_TOKENS:
         return False
     if _is_garbage_topic_phrase(normalized, topic_type=topic_type):
         return False
@@ -892,27 +947,61 @@ def _is_valid_topic_candidate(value: str, *, topic_type: str) -> bool:
         return False
     if _is_weak_topic_phrase(normalized, topic_type=topic_type):
         return False
-    return True
+    if any(token in TOPIC_URL_DEBRIS_TOKENS for token in tokens):
+        return False
+    if topic_type in {"entity", "keyword"} and all(token in WEAK_TOPIC_TOKENS for token in tokens):
+        return False
+
+    _canonical_key, _canonical_label, alias_confidence = canonicalize_topic_key(normalized_lower)
+    confidence = score_topic_candidate(
+        topic_key=normalized,
+        topic_type=topic_type,
+        alias_confidence=alias_confidence,
+    )
+    minimum_confidence = {
+        "cashtag": 0.34,
+        "hashtag": 0.38,
+        "entity": 0.45,
+        "keyword": 0.62,
+    }.get(topic_type, 0.50)
+    if len(tokens) == 1 and tokens[0] in TOPIC_ENTITY_ALLOWLIST:
+        minimum_confidence = min(minimum_confidence, 0.35)
+    return confidence >= minimum_confidence
 
 
 def _is_proper_like_token(token: str) -> bool:
     value = str(token or "").strip()
     if not value:
         return False
-    lower = value.lower()
+    lower = normalize_topic_key_text(value)
+    if not lower:
+        return False
     if lower in STOPWORD_TOKENS or lower in TOPIC_BLOCKLIST:
         return False
-    if lower in TOPIC_NOISE_TOKENS:
+    if lower in TOPIC_NOISE_TOKENS or lower in TOPIC_URL_DEBRIS_TOKENS:
+        return False
+    if lower in WEAK_TOPIC_TOKENS and lower not in TOPIC_ENTITY_ALLOWLIST:
         return False
     if len(lower) < 3 and lower not in TOPIC_ACRONYM_EXCEPTIONS:
         return False
     if value.isupper() and len(value) >= 2:
         return True
+    if len(lower) < 4 and lower not in TOPIC_ACRONYM_EXCEPTIONS and lower not in TOPIC_ENTITY_ALLOWLIST:
+        return False
     if value[:1].isupper() and any(character.islower() for character in value[1:]):
         return True
     if any(character.isupper() for character in value[1:]) and any(character.islower() for character in value):
         return True
     return False
+
+
+def _is_sentence_leading_token(text: str, *, token_start: int) -> bool:
+    if token_start <= 0:
+        return True
+    prefix = str(text[:token_start]).rstrip()
+    if not prefix:
+        return True
+    return prefix[-1] in ".!?;:\n"
 
 
 def _infer_topic_key_candidate(
@@ -1090,11 +1179,31 @@ def extractTopicEntities(raw_post: Dict[str, Any]) -> List[Dict[str, str]]:
 
     candidates: list[dict[str, str]] = []
     seen_normalized: set[str] = set()
+    source_quality = float(raw_post.get("quality_score") or 0.0)
 
     def add_candidate(topic_text: str, topic_type: str) -> None:
         normalized_topic = _normalize_topic_value(topic_text, topic_type=topic_type)
-        normalized_key = normalized_topic.lower()
+        normalized_key = normalize_topic_key_text(normalized_topic)
         if not _is_valid_topic_candidate(normalized_topic, topic_type=topic_type):
+            return
+        _canonical_key, _canonical_label, alias_confidence = canonicalize_topic_key(normalized_key)
+        confidence = score_topic_candidate(
+            topic_key=normalized_topic,
+            topic_type=topic_type,
+            source_quality=source_quality,
+            alias_confidence=alias_confidence,
+        )
+        minimum_confidence = {
+            "cashtag": 0.34,
+            "hashtag": 0.40,
+            "entity": 0.48,
+            "keyword": 0.62,
+        }.get(topic_type, 0.50)
+        if normalized_key in TOPIC_ENTITY_ALLOWLIST:
+            minimum_confidence = min(minimum_confidence, 0.34)
+        elif alias_confidence > 0:
+            minimum_confidence = min(minimum_confidence, 0.38)
+        if confidence < minimum_confidence:
             return
         if normalized_key in seen_normalized:
             return
@@ -1124,13 +1233,30 @@ def extractTopicEntities(raw_post: Dict[str, Any]) -> List[Dict[str, str]]:
     # 3 + 4) Proper nouns/acronyms and grouped adjacent name phrases
     phrase_matches = list(PHRASE_TOKEN_PATTERN.finditer(text_content))
     phrase_tokens = [match.group(0) for match in phrase_matches]
+    phrase_token_frequency: dict[str, int] = {}
+    for token in phrase_tokens:
+        lowered = normalize_topic_key_text(token)
+        if not lowered:
+            continue
+        phrase_token_frequency[lowered] = phrase_token_frequency.get(lowered, 0) + 1
     index = 0
     while index < len(phrase_tokens):
         token = phrase_tokens[index]
+        token_lower = normalize_topic_key_text(token)
         if not _is_proper_like_token(token):
             index += 1
             continue
-        if token.lower() in TOPIC_NOISE_TOKENS:
+        if token_lower in TOPIC_NOISE_TOKENS or token_lower in TOPIC_URL_DEBRIS_TOKENS:
+            index += 1
+            continue
+        if (
+            _is_sentence_leading_token(text_content, token_start=phrase_matches[index].start())
+            and token[:1].isupper()
+            and token[1:].islower()
+            and phrase_token_frequency.get(token_lower, 0) <= 1
+            and token_lower not in TOPIC_ENTITY_ALLOWLIST
+            and token_lower not in TOPIC_ACRONYM_EXCEPTIONS
+        ):
             index += 1
             continue
 
@@ -1138,13 +1264,13 @@ def extractTopicEntities(raw_post: Dict[str, Any]) -> List[Dict[str, str]]:
         cursor = index + 1
         while cursor < len(phrase_tokens) and len(grouped_tokens) < 5:
             next_token = phrase_tokens[cursor]
-            next_lower = next_token.lower()
+            next_lower = normalize_topic_key_text(next_token)
             between_text = text_content[
                 phrase_matches[cursor - 1].end() : phrase_matches[cursor].start()
             ]
             if any(marker in between_text for marker in (".", "!", "?", ";", ":", "\n")):
                 break
-            if next_lower in TOPIC_NOISE_TOKENS:
+            if next_lower in TOPIC_NOISE_TOKENS or next_lower in TOPIC_URL_DEBRIS_TOKENS:
                 break
             if (
                 next_lower in TOPIC_CONNECTOR_WORDS
@@ -1539,3 +1665,4 @@ def normalize_authors_for_authors_table(
         rows_by_id[author_id] = _merge_author_rows(existing, candidate) if existing else candidate
 
     return list(rows_by_id.values())
+
