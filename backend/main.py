@@ -233,6 +233,15 @@ def main() -> int:
     try:
         store.verify_connection()
         store.ensure_processed_topic_tables()
+        disabled_jobs = store.disable_legacy_topic_bucket_refresh_jobs()
+        if disabled_jobs > 0:
+            log_event(
+                logger,
+                logging.WARNING,
+                "legacy_topic_bucket_jobs_disabled",
+                source=source,
+                disabled_job_count=disabled_jobs,
+            )
         log_event(logger, logging.INFO, "db_connected", source=source)
     except Exception as error:
         log_event(logger, logging.ERROR, "db_connect_failed", source=source, error=str(error))
