@@ -1771,6 +1771,7 @@ class PostgresStore:
                             ('another'),
                             ('anyone'),
                             ('appreciate'),
+                            ('area'),
                             ('available'),
                             ('back'),
                             ('believe'),
@@ -1910,11 +1911,45 @@ class PostgresStore:
                             ('yes'),
                             ('young'),
                             ('you'),
-                            ('your')
+                            ('your'),
+                            ('de'),
+                            ('del'),
+                            ('der'),
+                            ('des'),
+                            ('die'),
+                            ('el'),
+                            ('en'),
+                            ('es'),
+                            ('est'),
+                            ('et'),
+                            ('ich'),
+                            ('la'),
+                            ('le'),
+                            ('mas'),
+                            ('pero'),
+                            ('por'),
+                            ('si'),
+                            ('una'),
+                            ('und')
+                    ),
+                    topic_noise_tokens(token) AS (
+                        VALUES
+                            ('additional'),
+                            ('advisory'),
+                            ('afd'),
+                            ('airnow'),
+                            ('aqi'),
+                            ('details'),
+                            ('discussion'),
+                            ('forecast'),
+                            ('iembot'),
+                            ('issued'),
+                            ('prelim'),
+                            ('statement'),
+                            ('update')
                     ),
                     single_word_topic_allowlist(token) AS (
                         VALUES
-                            ('ai'),
                             ('america'),
                             ('biden'),
                             ('bitcoin'),
@@ -1943,7 +1978,14 @@ class PostgresStore:
                         SELECT
                             date_trunc(
                                 'minute',
-                                COALESCE(pt.bucket_minute, pp.bucket_minute, pp.created_at, pp.processed_at, now())
+                                COALESCE(
+                                    pp.processed_at,
+                                    pt.bucket_minute,
+                                    pp.bucket_minute,
+                                    pp.source_created_at,
+                                    pp.created_at,
+                                    now()
+                                )
                             ) AS bucket_minute,
                             COALESCE(NULLIF(TRIM(pt.platform), ''), COALESCE(pp.platform, 'bluesky')) AS platform,
                             CASE
@@ -1990,7 +2032,14 @@ class PostgresStore:
                         WHERE COALESCE(pt.normalized_topic, '') <> ''
                           AND date_trunc(
                               'minute',
-                              COALESCE(pt.bucket_minute, pp.bucket_minute, pp.created_at, pp.processed_at, now())
+                              COALESCE(
+                                  pp.processed_at,
+                                  pt.bucket_minute,
+                                  pp.bucket_minute,
+                                  pp.source_created_at,
+                                  pp.created_at,
+                                  now()
+                              )
                           ) >= (SELECT recompute_from FROM aggregation_bounds)
                     ),
                     topic_mentions AS (
@@ -2006,19 +2055,33 @@ class PostgresStore:
                             is_reply,
                             has_link,
                             sentiment_label,
+                            topic_priority,
                             false AS from_fallback
                         FROM topic_mentions_raw
                         WHERE normalized_topic <> ''
                           AND normalized_topic NOT IN ('all', 'general')
                           AND normalized_topic NOT IN (SELECT token FROM weak_topic_tokens)
                           AND length(replace(normalized_topic, ' ', '')) >= 2
+                          AND array_length(string_to_array(normalized_topic, ' '), 1) <= 4
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
+                              WHERE topic_token.token <> ''
+                                AND topic_token.token IN (SELECT token FROM topic_noise_tokens)
+                          )
                         ORDER BY raw_post_id, platform, normalized_topic, topic_priority ASC, quality_score DESC
                     ),
                     fallback_mentions AS (
                         SELECT
                             date_trunc(
                                 'minute',
-                                COALESCE(pp.bucket_minute, pp.created_at, pp.processed_at, now())
+                                COALESCE(
+                                    pp.processed_at,
+                                    pp.bucket_minute,
+                                    pp.source_created_at,
+                                    pp.created_at,
+                                    now()
+                                )
                             ) AS bucket_minute,
                             COALESCE(pp.platform, 'bluesky') AS platform,
                             CASE
@@ -2062,12 +2125,19 @@ class PostgresStore:
                                     THEN pp.sentiment_label
                                 ELSE 'neutral'
                             END AS sentiment_label,
+                            9 AS topic_priority,
                             true AS from_fallback
                         FROM public.processed_posts pp
                         WHERE COALESCE(pp.topic, pp.topic_key_candidate, '') <> ''
                           AND date_trunc(
                               'minute',
-                              COALESCE(pp.bucket_minute, pp.created_at, pp.processed_at, now())
+                              COALESCE(
+                                  pp.processed_at,
+                                  pp.bucket_minute,
+                                  pp.source_created_at,
+                                  pp.created_at,
+                                  now()
+                              )
                           ) >= (SELECT recompute_from FROM aggregation_bounds)
                           AND NOT EXISTS (
                               SELECT 1
@@ -2087,16 +2157,50 @@ class PostgresStore:
                           AND normalized_topic NOT IN ('all', 'general')
                           AND normalized_topic NOT IN (SELECT token FROM weak_topic_tokens)
                           AND length(replace(normalized_topic, ' ', '')) >= 2
+                          AND array_length(string_to_array(normalized_topic, ' '), 1) <= 4
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
+                              WHERE topic_token.token <> ''
+                                AND topic_token.token IN (SELECT token FROM topic_noise_tokens)
+                          )
+                          AND normalized_topic !~* '(^| )([a-z0-9]+bot)( |$)'
+                          AND normalized_topic !~* '(area|forecast|discussion).*(afd|airnow|aqi)'
+                          AND normalized_topic !~* '(additional|details) here'
                           AND (
                               from_fallback = false
-                              OR POSITION(' ' IN normalized_topic) > 0
                               OR normalized_topic IN (SELECT token FROM single_word_topic_allowlist)
+                              OR (
+                                  POSITION(' ' IN normalized_topic) > 0
+                                  AND (
+                                      SELECT COUNT(*)
+                                      FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
+                                      WHERE topic_token.token <> ''
+                                        AND topic_token.token NOT IN (SELECT token FROM weak_topic_tokens)
+                                        AND topic_token.token NOT IN (SELECT token FROM topic_noise_tokens)
+                                        AND length(topic_token.token) >= 4
+                                  ) >= 2
+                              )
                           )
+                          AND (
+                              SELECT COUNT(*)
+                              FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
+                              WHERE topic_token.token <> ''
+                                AND (
+                                    topic_token.token IN (SELECT token FROM weak_topic_tokens)
+                                    OR topic_token.token IN (SELECT token FROM topic_noise_tokens)
+                                )
+                          ) <= GREATEST(1, array_length(string_to_array(normalized_topic, ' '), 1) - 1)
                           AND EXISTS (
                               SELECT 1
                               FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
                               WHERE topic_token.token <> ''
                                 AND topic_token.token NOT IN (SELECT token FROM weak_topic_tokens)
+                                AND topic_token.token NOT IN (SELECT token FROM topic_noise_tokens)
+                                AND (
+                                    length(topic_token.token) >= 4
+                                    OR topic_token.token IN (SELECT token FROM single_word_topic_allowlist)
+                                )
                           )
                     ),
                     aggregated AS (
@@ -2109,6 +2213,7 @@ class PostgresStore:
                             COUNT(DISTINCT raw_post_id)::INT AS unique_posts,
                             COALESCE(SUM(quality_score), 0)::numeric AS total_quality_score,
                             COALESCE(AVG(quality_score), 0)::numeric AS avg_quality_score,
+                            MIN(topic_priority)::INT AS best_topic_priority,
                             SUM(CASE WHEN is_repost THEN 1 ELSE 0 END)::INT AS repost_count,
                             SUM(CASE WHEN is_reply THEN 1 ELSE 0 END)::INT AS reply_count,
                             SUM(CASE WHEN has_link THEN 1 ELSE 0 END)::INT AS link_post_count,
@@ -2135,6 +2240,12 @@ class PostgresStore:
                         CROSS JOIN single_word_topic_minimum
                         WHERE
                             POSITION(' ' IN aggregated.normalized_topic) > 0
+                            OR aggregated.best_topic_priority <= 3
+                            OR (
+                                aggregated.best_topic_priority <= 4
+                                AND topic_totals.total_mentions >= 6
+                                AND aggregated.avg_quality_score >= 0.40
+                            )
                             OR aggregated.normalized_topic IN (
                                 SELECT token FROM single_word_topic_allowlist
                             )
