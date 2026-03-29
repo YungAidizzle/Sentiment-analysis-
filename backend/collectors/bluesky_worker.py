@@ -82,6 +82,129 @@ STOPWORD_TOKENS = {
     "with",
 }
 
+TOPIC_ACRONYM_EXCEPTIONS = {
+    "ai",
+    "api",
+    "btc",
+    "eth",
+    "eu",
+    "gop",
+    "nft",
+    "uk",
+    "un",
+    "usa",
+}
+
+WEAK_TOPIC_TOKENS = {
+    "a",
+    "about",
+    "after",
+    "all",
+    "also",
+    "am",
+    "an",
+    "and",
+    "any",
+    "are",
+    "as",
+    "at",
+    "be",
+    "because",
+    "been",
+    "before",
+    "being",
+    "both",
+    "but",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "dont",
+    "for",
+    "from",
+    "get",
+    "got",
+    "had",
+    "has",
+    "have",
+    "here",
+    "how",
+    "i",
+    "if",
+    "ill",
+    "im",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "ive",
+    "just",
+    "like",
+    "many",
+    "may",
+    "me",
+    "might",
+    "more",
+    "most",
+    "my",
+    "need",
+    "no",
+    "not",
+    "now",
+    "of",
+    "on",
+    "one",
+    "or",
+    "our",
+    "out",
+    "same",
+    "she",
+    "should",
+    "so",
+    "some",
+    "still",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "to",
+    "today",
+    "tomorrow",
+    "us",
+    "very",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "will",
+    "with",
+    "would",
+    "you",
+    "your",
+}
+
+TOPIC_CANONICAL_ALIASES = {
+    "nokings": "No Kings",
+    "no king": "No Kings",
+    "no kings": "No Kings",
+    "no kingss": "No Kings",
+    "no kings's": "No Kings",
+}
+
 CRYPTO_TERMS = {
     "airdrop",
     "altcoin",
@@ -315,6 +438,52 @@ def _normalize_topic_text(value: str) -> str:
     return candidate
 
 
+def _topic_tokens(value: str) -> list[str]:
+    return [token for token in re.findall(r"[a-z0-9]+", str(value or "").lower()) if token]
+
+
+def _is_weak_topic_phrase(value: str, *, topic_type: str) -> bool:
+    tokens = _topic_tokens(value)
+    if not tokens:
+        return True
+
+    candidate = str(value or "").strip()
+    if (
+        candidate.isupper()
+        and 2 <= len(candidate) <= 10
+        and candidate.lower() in TOPIC_ACRONYM_EXCEPTIONS
+    ):
+        return False
+
+    if len(tokens) == 1:
+        token = tokens[0]
+        if token in WEAK_TOPIC_TOKENS:
+            return True
+        if (
+            topic_type == "keyword"
+            and len(token) < 4
+            and token not in TOPIC_ACRONYM_EXCEPTIONS
+        ):
+            return True
+
+    weak_count = sum(1 for token in tokens if token in WEAK_TOPIC_TOKENS)
+    informative_count = sum(
+        1
+        for token in tokens
+        if token not in WEAK_TOPIC_TOKENS
+        and (len(token) >= 4 or token in TOPIC_ACRONYM_EXCEPTIONS)
+    )
+
+    if weak_count == len(tokens):
+        return True
+    if informative_count == 0 and weak_count >= 1:
+        return True
+    if topic_type == "keyword" and weak_count >= max(1, len(tokens) - 1):
+        return True
+
+    return False
+
+
 def _normalize_topic_value(value: str, *, topic_type: str) -> str:
     candidate = _normalize_topic_text(value)
     if not candidate:
@@ -323,7 +492,9 @@ def _normalize_topic_value(value: str, *, topic_type: str) -> str:
     if topic_type == "cashtag":
         return candidate.removeprefix("$").upper()
     if topic_type == "hashtag":
-        return candidate.removeprefix("#").lower()
+        hashtag_topic = candidate.removeprefix("#").lower()
+        alias = TOPIC_CANONICAL_ALIASES.get(hashtag_topic.replace("’", "'"))
+        return alias or hashtag_topic
 
     words = candidate.split(" ")
     normalized_words: list[str] = []
@@ -331,21 +502,32 @@ def _normalize_topic_value(value: str, *, topic_type: str) -> str:
         token = str(word or "").strip()
         if not token:
             continue
-        if token.lower() in TOPIC_CONNECTOR_WORDS:
+        cleaned = token[:-2] if token.lower().endswith("'s") and len(token) > 3 else token
+        if cleaned.lower() in TOPIC_CONNECTOR_WORDS:
             normalized_words.append(token.lower())
             continue
-        if token.isupper() and 2 <= len(token) <= 10:
-            normalized_words.append(token)
+        if cleaned.isupper() and 2 <= len(cleaned) <= 10:
+            normalized_words.append(cleaned)
             continue
-        if any(character.isdigit() for character in token):
-            normalized_words.append(token.upper() if token.isupper() else token)
+        if any(character.isdigit() for character in cleaned):
+            normalized_words.append(cleaned.upper() if cleaned.isupper() else cleaned)
             continue
-        if "-" in token:
-            normalized_words.append("-".join(part[:1].upper() + part[1:].lower() for part in token.split("-") if part))
+        if "-" in cleaned:
+            normalized_words.append(
+                "-".join(
+                    part[:1].upper() + part[1:].lower()
+                    for part in cleaned.split("-")
+                    if part
+                )
+            )
             continue
-        normalized_words.append(token[:1].upper() + token[1:].lower())
+        normalized_words.append(cleaned[:1].upper() + cleaned[1:].lower())
 
     normalized = " ".join(normalized_words).strip()
+    normalized_lookup = normalized.lower().replace("’", "'")
+    alias = TOPIC_CANONICAL_ALIASES.get(normalized_lookup)
+    if alias:
+        return alias
     return normalized
 
 
@@ -368,6 +550,8 @@ def _is_valid_topic_candidate(value: str, *, topic_type: str) -> bool:
     if topic_type == "keyword" and len(normalized_lower) < 4:
         return False
     if topic_type == "keyword" and normalized_lower in STOPWORD_TOKENS:
+        return False
+    if _is_weak_topic_phrase(normalized, topic_type=topic_type):
         return False
     return True
 
@@ -395,12 +579,20 @@ def _infer_topic_key_candidate(
     tags: List[str],
 ) -> str:
     if hashtags:
-        return hashtags[0]
-    prioritized = [token for token in tokens if len(token) >= 4]
+        for hashtag in hashtags:
+            if _is_valid_topic_candidate(f"#{hashtag}", topic_type="hashtag"):
+                return _normalize_topic_value(f"#{hashtag}", topic_type="hashtag")
+    prioritized = [
+        token
+        for token in tokens
+        if len(token) >= 4 and _is_valid_topic_candidate(token, topic_type="keyword")
+    ]
     if prioritized:
-        return prioritized[0]
+        return _normalize_topic_value(prioritized[0], topic_type="keyword")
     if tags:
-        return tags[0]
+        for tag in tags:
+            if _is_valid_topic_candidate(tag, topic_type="keyword"):
+                return _normalize_topic_value(tag, topic_type="keyword")
     return "general"
 
 
