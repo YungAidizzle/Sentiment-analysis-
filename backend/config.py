@@ -33,6 +33,7 @@ class WorkerConfig:
     batch_size: int
     loop_sleep_seconds: float
     retry_seconds: float
+    topic_aggregate_interval_seconds: float
     progress_update_seconds: float
     raw_retention_hours: float
     raw_cleanup_interval_seconds: float
@@ -44,6 +45,7 @@ class WorkerConfig:
         *,
         sleep_seconds: float | None = None,
         retry_seconds: float | None = None,
+        topic_aggregate_interval_seconds: float | None = None,
     ) -> "WorkerConfig":
         database_url = os.getenv("DATABASE_URL", "").strip()
         if not database_url:
@@ -63,6 +65,11 @@ class WorkerConfig:
             "BLUESKY_WORKER_RETRY_SECONDS",
             5.0,
             minimum=0.5,
+        )
+        configured_topic_aggregate_interval_seconds = _parse_float_env(
+            "BLUESKY_TOPIC_AGGREGATE_INTERVAL_SECONDS",
+            20.0,
+            minimum=0.0,
         )
         progress_update_seconds = _parse_float_env(
             "BLUESKY_WORKER_PROGRESS_UPDATE_SECONDS",
@@ -87,6 +94,12 @@ class WorkerConfig:
             batch_size=batch_size,
             loop_sleep_seconds=max(0.0, sleep_seconds if sleep_seconds is not None else configured_sleep_seconds),
             retry_seconds=max(0.5, retry_seconds if retry_seconds is not None else configured_retry_seconds),
+            topic_aggregate_interval_seconds=max(
+                0.0,
+                topic_aggregate_interval_seconds
+                if topic_aggregate_interval_seconds is not None
+                else configured_topic_aggregate_interval_seconds,
+            ),
             progress_update_seconds=progress_update_seconds,
             raw_retention_hours=raw_retention_hours,
             raw_cleanup_interval_seconds=raw_cleanup_interval_seconds,

@@ -162,6 +162,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--once", action="store_true", help="Run one firehose window and exit.")
     parser.add_argument("--sleep-seconds", type=float, default=None)
     parser.add_argument("--retry-seconds", type=float, default=None)
+    parser.add_argument(
+        "--topic-aggregate-interval-seconds",
+        type=float,
+        default=None,
+        help="Minimum seconds between topic_buckets_1m refreshes. Set 0 to disable.",
+    )
     parser.add_argument("--source", type=str, default="")
     parser.add_argument(
         "--max-cycles",
@@ -194,6 +200,7 @@ def main() -> int:
         config = WorkerConfig.from_env(
             sleep_seconds=args.sleep_seconds,
             retry_seconds=args.retry_seconds,
+            topic_aggregate_interval_seconds=args.topic_aggregate_interval_seconds,
         )
     except ValueError as error:
         print(str(error), file=sys.stderr)
@@ -289,6 +296,8 @@ def main() -> int:
     last_timings: dict[str, Any] = {}
     run_status = "running"
     last_raw_cleanup_at_monotonic = 0.0
+    last_topic_aggregate_at_monotonic = 0.0
+    pending_topic_aggregation = True
 
     stop_requested = False
 
@@ -336,6 +345,46 @@ def main() -> int:
         finally:
             last_raw_cleanup_at_monotonic = now_monotonic
 
+    def run_topic_aggregation_if_due(*, force: bool = False, reason: str) -> None:
+        nonlocal last_topic_aggregate_at_monotonic, pending_topic_aggregation
+        if config.topic_aggregate_interval_seconds <= 0:
+            return
+        if not force and not pending_topic_aggregation:
+            return
+
+        now_monotonic = time.monotonic()
+        if (
+            not force
+            and last_topic_aggregate_at_monotonic > 0
+            and (now_monotonic - last_topic_aggregate_at_monotonic) < config.topic_aggregate_interval_seconds
+        ):
+            return
+
+        try:
+            topic_rows_affected = store.aggregate_topic_buckets_1m_from_processed_posts()
+            pending_topic_aggregation = False
+            log_event(
+                logger,
+                logging.INFO,
+                "topic_aggregation_complete",
+                cycle=cycle,
+                reason=reason,
+                rows_affected=topic_rows_affected,
+                min_interval_seconds=config.topic_aggregate_interval_seconds,
+            )
+        except Exception as aggregation_error:
+            log_event(
+                logger,
+                logging.ERROR,
+                "topic_aggregation_failed",
+                cycle=cycle,
+                reason=reason,
+                error=str(aggregation_error),
+                min_interval_seconds=config.topic_aggregate_interval_seconds,
+            )
+        finally:
+            last_topic_aggregate_at_monotonic = now_monotonic
+
     initial_notes = _build_run_notes(
         cycle=cycle,
         cursor_us=cursor_us,
@@ -367,12 +416,14 @@ def main() -> int:
         resumed_cursor=cursor_us or 0,
         once=args.once,
         max_cycles=args.max_cycles,
+        topic_aggregate_interval_seconds=config.topic_aggregate_interval_seconds,
         raw_retention_hours=config.raw_retention_hours,
         raw_cleanup_interval_seconds=config.raw_cleanup_interval_seconds,
     )
 
     try:
         run_raw_cleanup_if_due(force=True)
+        run_topic_aggregation_if_due(force=True, reason="startup")
         while not stop_requested:
             if args.max_cycles > 0 and cycle >= args.max_cycles:
                 run_status = "completed"
@@ -488,6 +539,7 @@ def main() -> int:
                         )
                         if processed_result:
                             processed_posts += 1
+                            pending_topic_aggregation = True
                             post_topics_persisted += persistPostTopics(
                                 store=store,
                                 raw_row=ingested_raw,
@@ -556,6 +608,7 @@ def main() -> int:
                     connection_status=state.get("connectionStatus"),
                     duration_ms=cycle_duration_ms,
                 )
+                run_topic_aggregation_if_due(reason="cycle_complete")
             except KeyboardInterrupt:
                 stop_requested = True
                 run_status = "stopped"
@@ -597,6 +650,7 @@ def main() -> int:
                     cycle=cycle,
                     error=last_error,
                 )
+                run_topic_aggregation_if_due(reason="cycle_error")
 
                 if args.once:
                     run_status = "failed"
@@ -617,6 +671,7 @@ def main() -> int:
             run_status = "stopped"
             shutdown_reason = shutdown_reason if shutdown_reason != "running" else "loop_exit"
     finally:
+        run_topic_aggregation_if_due(force=True, reason="shutdown")
         final_notes = _build_run_notes(
             cycle=cycle,
             cursor_us=cursor_us,
