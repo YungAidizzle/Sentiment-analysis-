@@ -154,6 +154,27 @@ class BlueskyWorkerNormalizationTests(unittest.TestCase):
         self.assertNotIn("you", normalized_lower)
         self.assertNotIn("we", normalized_lower)
 
+    def test_extract_topic_entities_suppresses_chatty_single_words_but_keeps_real_entities(self):
+        raw_row = {
+            "text_content": (
+                "Thank you Bluesky feed update. Love this social app. "
+                "Trump comments on Iran while crowds post #NoKings."
+            )
+        }
+
+        topics = extractTopicEntities(raw_row)
+        normalized_topics = [row["normalized_topic"] for row in topics]
+        normalized_lower = [topic.lower() for topic in normalized_topics]
+
+        self.assertIn("No Kings", normalized_topics)
+        self.assertIn("Trump", normalized_topics)
+        self.assertIn("Iran", normalized_topics)
+        self.assertNotIn("thank", normalized_lower)
+        self.assertNotIn("bluesky", normalized_lower)
+        self.assertNotIn("feed", normalized_lower)
+        self.assertNotIn("love", normalized_lower)
+        self.assertNotIn("social", normalized_lower)
+
     def test_analyze_sentiment_applies_weighted_lexicon(self):
         sentiment = analyzeSentiment(
             clean_text="I love this but hate the bad execution, still ok overall.",
