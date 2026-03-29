@@ -20,7 +20,6 @@ PHRASE_TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9&'-]*")
 
 TOPIC_CONNECTOR_WORDS = {
     "&",
-    "and",
     "at",
     "for",
     "in",
@@ -83,17 +82,46 @@ STOPWORD_TOKENS = {
 }
 
 TOPIC_ACRONYM_EXCEPTIONS = {
-    "ai",
     "api",
     "btc",
+    "djt",
     "eth",
     "eu",
+    "fbi",
     "gop",
+    "nfl",
+    "nba",
+    "nsa",
     "nft",
+    "sec",
+    "spy",
     "uk",
     "un",
     "usa",
+    "xrp",
 }
+
+TOPIC_NOISE_TOKENS = {
+    "additional",
+    "advisory",
+    "afd",
+    "airnow",
+    "aqi",
+    "details",
+    "discussion",
+    "forecast",
+    "iembot",
+    "issued",
+    "prelim",
+    "statement",
+    "update",
+}
+
+TOPIC_GARBAGE_PHRASE_PATTERNS = (
+    re.compile(r"\b(?:area|forecast|discussion)\b.*\b(?:afd|airnow|aqi)\b", re.IGNORECASE),
+    re.compile(r"\b(?:additional|details)\s+here\b", re.IGNORECASE),
+    re.compile(r"\b[a-z0-9]+bot\b", re.IGNORECASE),
+)
 
 WEAK_TOPIC_TOKENS = {
     "a",
@@ -205,6 +233,7 @@ WEAK_TOPIC_TOKENS = {
     "another",
     "anyone",
     "appreciate",
+    "area",
     "available",
     "back",
     "believe",
@@ -220,10 +249,20 @@ WEAK_TOPIC_TOKENS = {
     "cool",
     "cute",
     "day",
+    "de",
+    "del",
+    "der",
+    "des",
+    "die",
     "digit",
     "doing",
     "don",
     "early",
+    "el",
+    "en",
+    "es",
+    "est",
+    "et",
     "else",
     "enjoy",
     "even",
@@ -255,6 +294,7 @@ WEAK_TOPIC_TOKENS = {
     "his",
     "hope",
     "house",
+    "ich",
     "id",
     "imagine",
     "incredible",
@@ -262,7 +302,9 @@ WEAK_TOPIC_TOKENS = {
     "internet",
     "kind",
     "know",
+    "la",
     "last",
+    "le",
     "lets",
     "little",
     "live",
@@ -270,6 +312,7 @@ WEAK_TOPIC_TOKENS = {
     "loved",
     "love",
     "major",
+    "mas",
     "make",
     "making",
     "mean",
@@ -291,6 +334,8 @@ WEAK_TOPIC_TOKENS = {
     "original",
     "over",
     "part",
+    "pero",
+    "por",
     "photography",
     "place",
     "please",
@@ -305,6 +350,7 @@ WEAK_TOPIC_TOKENS = {
     "say",
     "see",
     "seems",
+    "si",
     "share",
     "shit",
     "short",
@@ -331,6 +377,8 @@ WEAK_TOPIC_TOKENS = {
     "true",
     "trying",
     "tv",
+    "una",
+    "und",
     "video",
     "vote",
     "wait",
@@ -592,22 +640,87 @@ def _topic_tokens(value: str) -> list[str]:
     return [token for token in re.findall(r"[a-z0-9]+", str(value or "").lower()) if token]
 
 
+def _is_acronym_like_token(value: str) -> bool:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return False
+    if not candidate.isupper():
+        return False
+    if not (2 <= len(candidate) <= 10):
+        return False
+    return any(character.isalpha() for character in candidate)
+
+
+def _is_garbage_topic_phrase(value: str, *, topic_type: str) -> bool:
+    normalized_value = _normalize_whitespace(str(value or "").lower())
+    tokens = _topic_tokens(normalized_value)
+    if not tokens:
+        return True
+
+    if len(tokens) > 5:
+        return True
+    if any(pattern.search(normalized_value) for pattern in TOPIC_GARBAGE_PHRASE_PATTERNS):
+        return True
+
+    noise_count = sum(1 for token in tokens if token in TOPIC_NOISE_TOKENS)
+    weak_count = sum(1 for token in tokens if token in WEAK_TOPIC_TOKENS)
+    informative_count = sum(
+        1
+        for token in tokens
+        if token not in WEAK_TOPIC_TOKENS
+        and token not in TOPIC_NOISE_TOKENS
+        and (len(token) >= 4 or token in TOPIC_ACRONYM_EXCEPTIONS)
+    )
+
+    if len(tokens) == 1 and tokens[0] in TOPIC_NOISE_TOKENS:
+        return True
+    if noise_count >= max(2, len(tokens) - 1):
+        return True
+    if len(tokens) >= 4 and noise_count >= 2:
+        return True
+    if informative_count == 0 and not (len(tokens) == 1 and _is_acronym_like_token(str(value or "").strip())):
+        return True
+    if topic_type == "keyword" and len(tokens) > 2:
+        return True
+    if topic_type in {"entity", "keyword"} and weak_count >= max(1, len(tokens) - 1):
+        return True
+    return False
+
+
+def _is_high_signal_keyword_token(value: str) -> bool:
+    token = str(value or "").strip().lower()
+    if not token:
+        return False
+    if token in STOPWORD_TOKENS or token in TOPIC_BLOCKLIST:
+        return False
+    if token in WEAK_TOPIC_TOKENS or token in TOPIC_NOISE_TOKENS:
+        return False
+    if len(token) < 4:
+        return False
+    if token.isdigit():
+        return False
+    return True
+
+
 def _is_weak_topic_phrase(value: str, *, topic_type: str) -> bool:
     tokens = _topic_tokens(value)
     if not tokens:
         return True
 
     candidate = str(value or "").strip()
-    if (
-        candidate.isupper()
-        and 2 <= len(candidate) <= 10
-        and candidate.lower() in TOPIC_ACRONYM_EXCEPTIONS
-    ):
+    candidate_lower = candidate.lower()
+    if _is_acronym_like_token(candidate):
+        if candidate_lower in WEAK_TOPIC_TOKENS or candidate_lower in TOPIC_NOISE_TOKENS:
+            return True
         return False
+    if _is_garbage_topic_phrase(value, topic_type=topic_type):
+        return True
 
     if len(tokens) == 1:
         token = tokens[0]
-        if token in WEAK_TOPIC_TOKENS:
+        if token in WEAK_TOPIC_TOKENS or token in TOPIC_NOISE_TOKENS:
+            return True
+        if len(token) < 3 and token not in TOPIC_ACRONYM_EXCEPTIONS:
             return True
         if (
             topic_type == "keyword"
@@ -616,19 +729,26 @@ def _is_weak_topic_phrase(value: str, *, topic_type: str) -> bool:
         ):
             return True
 
-    weak_count = sum(1 for token in tokens if token in WEAK_TOPIC_TOKENS)
+    weak_count = sum(
+        1
+        for token in tokens
+        if token in WEAK_TOPIC_TOKENS or token in TOPIC_NOISE_TOKENS
+    )
     informative_count = sum(
         1
         for token in tokens
         if token not in WEAK_TOPIC_TOKENS
+        and token not in TOPIC_NOISE_TOKENS
         and (len(token) >= 4 or token in TOPIC_ACRONYM_EXCEPTIONS)
     )
 
     if weak_count == len(tokens):
         return True
-    if informative_count == 0 and weak_count >= 1:
+    if informative_count == 0:
         return True
     if topic_type == "keyword" and weak_count >= max(1, len(tokens) - 1):
+        return True
+    if len(tokens) >= 4 and weak_count >= 2:
         return True
 
     return False
@@ -688,14 +808,23 @@ def _is_valid_topic_candidate(value: str, *, topic_type: str) -> bool:
 
     normalized = _normalize_topic_value(candidate, topic_type=topic_type)
     normalized_lower = normalized.lower()
+    tokens = _topic_tokens(normalized)
 
     if not normalized:
         return False
+    if not tokens:
+        return False
     if len(normalized) < 2:
+        return False
+    if len(tokens) > 5:
         return False
     if normalized.isdigit():
         return False
     if normalized_lower in TOPIC_BLOCKLIST:
+        return False
+    if len(tokens) == 1 and tokens[0] in TOPIC_NOISE_TOKENS:
+        return False
+    if _is_garbage_topic_phrase(normalized, topic_type=topic_type):
         return False
     if topic_type == "keyword" and len(normalized_lower) < 4:
         return False
@@ -712,6 +841,10 @@ def _is_proper_like_token(token: str) -> bool:
         return False
     lower = value.lower()
     if lower in STOPWORD_TOKENS or lower in TOPIC_BLOCKLIST:
+        return False
+    if lower in TOPIC_NOISE_TOKENS:
+        return False
+    if len(lower) < 3 and lower not in TOPIC_ACRONYM_EXCEPTIONS:
         return False
     if value.isupper() and len(value) >= 2:
         return True
@@ -735,14 +868,11 @@ def _infer_topic_key_candidate(
     prioritized = [
         token
         for token in tokens
-        if len(token) >= 4 and _is_valid_topic_candidate(token, topic_type="keyword")
+        if _is_high_signal_keyword_token(token)
+        and _is_valid_topic_candidate(token, topic_type="keyword")
     ]
     if prioritized:
         return _normalize_topic_value(prioritized[0], topic_type="keyword")
-    if tags:
-        for tag in tags:
-            if _is_valid_topic_candidate(tag, topic_type="keyword"):
-                return _normalize_topic_value(tag, topic_type="keyword")
     return "general"
 
 
@@ -940,10 +1070,13 @@ def extractTopicEntities(raw_post: Dict[str, Any]) -> List[Dict[str, str]]:
         if not _is_proper_like_token(token):
             index += 1
             continue
+        if token.lower() in TOPIC_NOISE_TOKENS:
+            index += 1
+            continue
 
         grouped_tokens = [token]
         cursor = index + 1
-        while cursor < len(phrase_tokens) and len(grouped_tokens) < 8:
+        while cursor < len(phrase_tokens) and len(grouped_tokens) < 5:
             next_token = phrase_tokens[cursor]
             next_lower = next_token.lower()
             between_text = text_content[
@@ -951,10 +1084,8 @@ def extractTopicEntities(raw_post: Dict[str, Any]) -> List[Dict[str, str]]:
             ]
             if any(marker in between_text for marker in (".", "!", "?", ";", ":", "\n")):
                 break
-            if _is_proper_like_token(next_token):
-                grouped_tokens.append(next_token)
-                cursor += 1
-                continue
+            if next_lower in TOPIC_NOISE_TOKENS:
+                break
             if (
                 next_lower in TOPIC_CONNECTOR_WORDS
                 and (cursor + 1) < len(phrase_tokens)
@@ -972,9 +1103,7 @@ def extractTopicEntities(raw_post: Dict[str, Any]) -> List[Dict[str, str]]:
     # 5) Keyword fallback if no better topic candidates were found.
     if not candidates:
         for token in _extract_tokens(text_content):
-            if token in TOPIC_BLOCKLIST:
-                continue
-            if token in STOPWORD_TOKENS:
+            if not _is_high_signal_keyword_token(token):
                 continue
             add_candidate(token, "keyword")
             if len(candidates) >= 5:

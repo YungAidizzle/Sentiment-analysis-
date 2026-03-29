@@ -175,6 +175,43 @@ class BlueskyWorkerNormalizationTests(unittest.TestCase):
         self.assertNotIn("love", normalized_lower)
         self.assertNotIn("social", normalized_lower)
 
+    def test_extract_topic_entities_rejects_feed_artifact_fragments(self):
+        raw_row = {
+            "text_content": (
+                "IEMBOT additional details here. Area Forecast Discussion AFD at Mar. "
+                "Prelim AirNow AQI update. Trump and Polymarket react to NYSE while $DJT moves."
+            )
+        }
+
+        topics = extractTopicEntities(raw_row)
+        normalized_topics = [row["normalized_topic"] for row in topics]
+        normalized_lower = [topic.lower() for topic in normalized_topics]
+
+        self.assertIn("Trump", normalized_topics)
+        self.assertIn("Polymarket", normalized_topics)
+        self.assertIn("NYSE", normalized_topics)
+        self.assertIn("DJT", normalized_topics)
+        self.assertNotIn("iembot additional details here", normalized_lower)
+        self.assertNotIn("area forecast discussion afd at mar", normalized_lower)
+        self.assertNotIn("prelim airnow aqi", normalized_lower)
+
+    def test_extract_topic_entities_filters_foreign_function_word_fragments(self):
+        raw_row = {
+            "text_content": (
+                "de ich c'est und por pero. Trump posts updates while #NoKings trends."
+            )
+        }
+
+        topics = extractTopicEntities(raw_row)
+        normalized_topics = [row["normalized_topic"] for row in topics]
+        normalized_lower = [topic.lower() for topic in normalized_topics]
+
+        self.assertIn("Trump", normalized_topics)
+        self.assertIn("No Kings", normalized_topics)
+        self.assertNotIn("de", normalized_lower)
+        self.assertNotIn("ich", normalized_lower)
+        self.assertNotIn("c est", normalized_lower)
+
     def test_analyze_sentiment_applies_weighted_lexicon(self):
         sentiment = analyzeSentiment(
             clean_text="I love this but hate the bad execution, still ok overall.",
