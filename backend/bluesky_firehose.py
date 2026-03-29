@@ -824,11 +824,21 @@ def sync_bluesky_firehose(
     reference_time: datetime | None = None,
     firehose_enabled: bool | None = None,
     event_iter_factory: FirehoseEventIteratorFactory | None = None,
+    max_seconds: int | None = None,
+    max_events: int | None = None,
     progress_callback: BlueskyFirehoseProgressCallback | None = None,
 ) -> Dict[str, Any]:
     started_at = perf_counter()
     now = _utc_now(reference_time)
     fetched_at = now.isoformat()
+    effective_max_seconds = max(
+        1,
+        int(max_seconds if max_seconds is not None else BLUESKY_FIREHOSE_MAX_SECONDS_PER_RUN),
+    )
+    effective_max_events = max(
+        1,
+        int(max_events if max_events is not None else BLUESKY_FIREHOSE_MAX_EVENTS_PER_RUN),
+    )
     cutoff_utc = int((now - timedelta(hours=BLUESKY_FIREHOSE_RETENTION_HOURS)).timestamp())
     cutoff_dt = now - timedelta(hours=BLUESKY_FIREHOSE_RETENTION_HOURS)
     firehose_enabled = (
@@ -1223,14 +1233,14 @@ def sync_bluesky_firehose(
 
     last_iterator_error: Exception | None = None
     reconnect_attempt = 0
-    stream_deadline = monotonic() + max(1, BLUESKY_FIREHOSE_MAX_SECONDS_PER_RUN)
+    stream_deadline = monotonic() + effective_max_seconds
 
     while (
         monotonic() < stream_deadline
-        and stats["eventsProcessed"] < BLUESKY_FIREHOSE_MAX_EVENTS_PER_RUN
+        and stats["eventsProcessed"] < effective_max_events
     ):
         remaining_seconds = max(1, int(stream_deadline - monotonic()))
-        remaining_events = max(1, BLUESKY_FIREHOSE_MAX_EVENTS_PER_RUN - stats["eventsProcessed"])
+        remaining_events = max(1, effective_max_events - stats["eventsProcessed"])
         resume_cursor = last_event_time_us or cursor
         if resume_cursor > 0:
             resume_cursor = max(0, resume_cursor - rewind_us)

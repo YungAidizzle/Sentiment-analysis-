@@ -21,6 +21,8 @@ This worker runs independently from the frontend and continuously ingests Bluesk
 
 - `BLUESKY_WORKER_SOURCE` (default: `bluesky_firehose_worker`)
 - `BLUESKY_DB_BATCH_SIZE` (default: `200`)
+- `BLUESKY_WORKER_FIREHOSE_MAX_SECONDS_PER_CYCLE` (default: `12`)
+- `BLUESKY_WORKER_FIREHOSE_MAX_EVENTS_PER_CYCLE` (default: `12000`)
 - `BLUESKY_WORKER_LOOP_SLEEP_SECONDS` (default: `2`)
 - `BLUESKY_WORKER_RETRY_SECONDS` (default: `5`)
 - `BLUESKY_TOPIC_AGGREGATE_INTERVAL_SECONDS` (default: `20`; set `0` to disable periodic `topic_buckets_1m` refresh)

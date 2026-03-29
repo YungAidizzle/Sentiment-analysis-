@@ -31,6 +31,8 @@ class WorkerConfig:
     database_url: str
     source: str
     batch_size: int
+    firehose_window_max_seconds: int
+    firehose_window_max_events: int
     loop_sleep_seconds: float
     retry_seconds: float
     topic_aggregate_interval_seconds: float
@@ -46,6 +48,8 @@ class WorkerConfig:
         sleep_seconds: float | None = None,
         retry_seconds: float | None = None,
         topic_aggregate_interval_seconds: float | None = None,
+        firehose_window_max_seconds: int | None = None,
+        firehose_window_max_events: int | None = None,
     ) -> "WorkerConfig":
         database_url = os.getenv("DATABASE_URL", "").strip()
         if not database_url:
@@ -56,6 +60,16 @@ class WorkerConfig:
             source = "bluesky_firehose_worker"
 
         batch_size = _parse_int_env("BLUESKY_DB_BATCH_SIZE", 200, minimum=1)
+        configured_firehose_window_max_seconds = _parse_int_env(
+            "BLUESKY_WORKER_FIREHOSE_MAX_SECONDS_PER_CYCLE",
+            12,
+            minimum=1,
+        )
+        configured_firehose_window_max_events = _parse_int_env(
+            "BLUESKY_WORKER_FIREHOSE_MAX_EVENTS_PER_CYCLE",
+            12000,
+            minimum=1,
+        )
         configured_sleep_seconds = _parse_float_env(
             "BLUESKY_WORKER_LOOP_SLEEP_SECONDS",
             2.0,
@@ -92,6 +106,22 @@ class WorkerConfig:
             database_url=database_url,
             source=source,
             batch_size=batch_size,
+            firehose_window_max_seconds=max(
+                1,
+                int(
+                    firehose_window_max_seconds
+                    if firehose_window_max_seconds is not None
+                    else configured_firehose_window_max_seconds
+                ),
+            ),
+            firehose_window_max_events=max(
+                1,
+                int(
+                    firehose_window_max_events
+                    if firehose_window_max_events is not None
+                    else configured_firehose_window_max_events
+                ),
+            ),
             loop_sleep_seconds=max(0.0, sleep_seconds if sleep_seconds is not None else configured_sleep_seconds),
             retry_seconds=max(0.5, retry_seconds if retry_seconds is not None else configured_retry_seconds),
             topic_aggregate_interval_seconds=max(

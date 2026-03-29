@@ -73,6 +73,25 @@ class BlueskyWorkerNormalizationTests(unittest.TestCase):
         self.assertEqual(row["metrics_json"]["likeCount"], 5)
         self.assertEqual(row["raw_json"]["id"], posts[0]["id"])
 
+    def test_normalize_incoming_event_clamps_future_created_at_to_indexed_at(self):
+        ingested_at = datetime(2026, 3, 25, 10, 0, tzinfo=timezone.utc)
+        indexed_at = datetime(2026, 3, 25, 9, 59, tzinfo=timezone.utc)
+        event = {
+            "id": "at://did:plc:abc/app.bsky.feed.post/124",
+            "uri": "at://did:plc:abc/app.bsky.feed.post/124",
+            "authorDid": "did:plc:abc",
+            "createdUtc": int(datetime(2026, 3, 26, 9, 30, tzinfo=timezone.utc).timestamp()),
+            "indexedAt": indexed_at.isoformat(),
+            "summary": "future created timestamp should be clamped",
+        }
+
+        row = normalizeIncomingEvent(event, ingested_at=ingested_at)
+
+        self.assertIsNotNone(row)
+        if row is None:
+            return
+        self.assertEqual(row["created_at"], indexed_at)
+
     def test_extract_features_and_process_raw_post_adds_generic_fields(self):
         raw_row = {
             "id": 99,

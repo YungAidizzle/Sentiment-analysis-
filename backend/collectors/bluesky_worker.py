@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List
 from urllib.parse import urlparse
 
@@ -640,6 +640,8 @@ def _parse_followers_count(value: Any) -> int | None:
 def run_firehose_window(
     *,
     cursor_us: int | None,
+    max_seconds: int | None = None,
+    max_events: int | None = None,
     progress_callback: Any | None = None,
 ) -> Dict[str, Any]:
     existing_state: Dict[str, Any] = {}
@@ -651,6 +653,8 @@ def run_firehose_window(
         existing_profiles=[],
         existing_interactions=[],
         existing_state=existing_state,
+        max_seconds=max_seconds,
+        max_events=max_events,
         progress_callback=progress_callback,
     )
 
@@ -665,11 +669,16 @@ def normalizeIncomingEvent(
         return None
 
     text_content = str(event.get("summary") or event.get("title") or "").strip()
+    indexed_at = _to_utc_datetime(event.get("indexedAt"))
     created_at = _to_utc_datetime(event.get("createdUtc"))
     if created_at is None:
-        created_at = _to_utc_datetime(event.get("indexedAt"))
+        created_at = indexed_at
     if created_at is None:
         created_at = ingested_at
+
+    max_future_allowed = ingested_at + timedelta(minutes=5)
+    if created_at > max_future_allowed:
+        created_at = indexed_at if indexed_at and indexed_at <= max_future_allowed else ingested_at
 
     urls = _extract_urls(text_content)
     hashtags = _extract_hashtags(text_content)

@@ -160,6 +160,18 @@ def _build_run_notes(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Persistent Bluesky ingestion worker")
     parser.add_argument("--once", action="store_true", help="Run one firehose window and exit.")
+    parser.add_argument(
+        "--firehose-max-seconds",
+        type=int,
+        default=None,
+        help="Max seconds to consume Jetstream per cycle.",
+    )
+    parser.add_argument(
+        "--firehose-max-events",
+        type=int,
+        default=None,
+        help="Max events to consume from Jetstream per cycle.",
+    )
     parser.add_argument("--sleep-seconds", type=float, default=None)
     parser.add_argument("--retry-seconds", type=float, default=None)
     parser.add_argument(
@@ -201,6 +213,8 @@ def main() -> int:
             sleep_seconds=args.sleep_seconds,
             retry_seconds=args.retry_seconds,
             topic_aggregate_interval_seconds=args.topic_aggregate_interval_seconds,
+            firehose_window_max_seconds=args.firehose_max_seconds,
+            firehose_window_max_events=args.firehose_max_events,
         )
     except ValueError as error:
         print(str(error), file=sys.stderr)
@@ -416,6 +430,8 @@ def main() -> int:
         resumed_cursor=cursor_us or 0,
         once=args.once,
         max_cycles=args.max_cycles,
+        firehose_window_max_seconds=config.firehose_window_max_seconds,
+        firehose_window_max_events=config.firehose_window_max_events,
         topic_aggregate_interval_seconds=config.topic_aggregate_interval_seconds,
         raw_retention_hours=config.raw_retention_hours,
         raw_cleanup_interval_seconds=config.raw_cleanup_interval_seconds,
@@ -485,7 +501,12 @@ def main() -> int:
             )
 
             try:
-                result = run_firehose_window(cursor_us=cursor_us, progress_callback=write_progress)
+                result = run_firehose_window(
+                    cursor_us=cursor_us,
+                    max_seconds=config.firehose_window_max_seconds,
+                    max_events=config.firehose_window_max_events,
+                    progress_callback=write_progress,
+                )
                 ingested_at = _utc_now()
                 posts = list(result.get("posts") or [])
                 profiles = list(result.get("profiles") or [])
@@ -547,6 +568,7 @@ def main() -> int:
                                 topic_entities=topic_entities,
                                 created_at=ingested_at,
                             )
+                            run_topic_aggregation_if_due(reason="post_processed")
                     except Exception as processing_error:
                         processing_errors += 1
                         log_event(
