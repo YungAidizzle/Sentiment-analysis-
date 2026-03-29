@@ -77,6 +77,34 @@ class PostgresStore:
 
         self._run_with_retry("verify_connection", operation)
 
+    def disable_legacy_topic_bucket_refresh_jobs(self) -> int:
+        def operation(connection: psycopg.Connection[Any]) -> int:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT to_regclass('cron.job')")
+                cron_job_relation = cursor.fetchone()
+                if not cron_job_relation or cron_job_relation[0] is None:
+                    return 0
+
+                cursor.execute(
+                    """
+                    SELECT jobid
+                    FROM cron.job
+                    WHERE active = TRUE
+                      AND (
+                          jobname = 'topic_buckets_refresh_every_minute'
+                          OR command ILIKE '%%run_topic_bucket_refresh_job%%'
+                          OR command ILIKE '%%refresh_topic_buckets_1m%%'
+                      )
+                    ORDER BY jobid ASC
+                    """
+                )
+                job_ids = [int(row[0]) for row in cursor.fetchall() if row and row[0] is not None]
+                for job_id in job_ids:
+                    cursor.execute("SELECT cron.unschedule(%s)", (job_id,))
+                return len(job_ids)
+
+        return self._execute_write("disable_legacy_topic_bucket_refresh_jobs", operation)
+
     def fetch_resume_cursor(self, *, source: str) -> int | None:
         def operation(connection: psycopg.Connection[Any]) -> int | None:
             with connection.cursor() as cursor:

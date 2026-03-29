@@ -110,6 +110,21 @@ class FakeCursor:
             self._fetchone = None
             self.rowcount = len(self._fetchall)
             return
+        if "select to_regclass('cron.job')" in normalized:
+            self._fetchone = ("cron.job",)
+            self._fetchall = []
+            self.rowcount = 1
+            return
+        if "select jobid from cron.job" in normalized:
+            self._fetchall = [(11,), (12,)]
+            self._fetchone = None
+            self.rowcount = len(self._fetchall)
+            return
+        if "select cron.unschedule" in normalized:
+            self._fetchone = (True,)
+            self._fetchall = []
+            self.rowcount = 1
+            return
         if "select 1" in normalized:
             self._fetchone = (1,)
             self._fetchall = []
@@ -215,6 +230,23 @@ class WorkerDbTests(unittest.TestCase):
         self.assertTrue(
             any("SELECT 1" in str(query) for query, _params in fake_connection.execute_calls)
         )
+
+    @patch("backend.db.psycopg.connect")
+    def test_disable_legacy_topic_bucket_refresh_jobs_unschedules_pg_cron_jobs(self, connect_mock):
+        fake_connection = FakeConnection()
+        connect_mock.return_value = fake_connection
+        store = PostgresStore(
+            database_url="postgresql://example",
+            batch_size=50,
+        )
+
+        disabled = store.disable_legacy_topic_bucket_refresh_jobs()
+
+        self.assertEqual(disabled, 2)
+        queries = [str(query) for query, _params in fake_connection.execute_calls]
+        self.assertTrue(any("to_regclass('cron.job')" in query for query in queries))
+        self.assertTrue(any("FROM cron.job" in query for query in queries))
+        self.assertTrue(any("SELECT cron.unschedule" in query for query in queries))
 
     @patch("backend.db.psycopg.connect")
     def test_fetch_resume_cursor_reads_notes_json(self, connect_mock):
