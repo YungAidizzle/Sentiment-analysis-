@@ -1314,6 +1314,45 @@ class PostgresStore:
                 cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
                 cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS bucket_start TIMESTAMPTZ")
                 cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS topic TEXT")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS normalized_topic TEXT")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS topic_display TEXT")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS unique_posts INTEGER")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS positive_count INTEGER")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS neutral_count INTEGER")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS negative_count INTEGER")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS sentiment_net INTEGER")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS sentiment_score DOUBLE PRECISION")
+                cursor.execute("ALTER TABLE public.topic_buckets_1m ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ")
+                cursor.execute(
+                    """
+                    UPDATE public.topic_buckets_1m
+                    SET normalized_topic = COALESCE(
+                            NULLIF(TRIM(normalized_topic), ''),
+                            LOWER(COALESCE(NULLIF(TRIM(topic_key), ''), 'all'))
+                        ),
+                        topic_display = COALESCE(
+                            NULLIF(TRIM(topic_display), ''),
+                            NULLIF(TRIM(topic), ''),
+                            INITCAP(COALESCE(NULLIF(TRIM(topic_key), ''), 'all'))
+                        ),
+                        unique_posts = COALESCE(unique_posts, mention_count, 0),
+                        positive_count = COALESCE(positive_count, 0),
+                        neutral_count = COALESCE(neutral_count, mention_count, 0),
+                        negative_count = COALESCE(negative_count, 0),
+                        sentiment_net = COALESCE(sentiment_net, 0),
+                        sentiment_score = COALESCE(sentiment_score, 0),
+                        updated_at = COALESCE(updated_at, created_at, now())
+                    WHERE normalized_topic IS NULL
+                       OR topic_display IS NULL
+                       OR unique_posts IS NULL
+                       OR positive_count IS NULL
+                       OR neutral_count IS NULL
+                       OR negative_count IS NULL
+                       OR sentiment_net IS NULL
+                       OR sentiment_score IS NULL
+                       OR updated_at IS NULL
+                    """
+                )
                 cursor.execute(
                     """
                     CREATE UNIQUE INDEX IF NOT EXISTS uq_topic_buckets_1m_bucket_platform_topic
@@ -1598,6 +1637,240 @@ class PostgresStore:
                 cursor.execute("TRUNCATE TABLE public.topic_buckets_1m")
                 cursor.execute(
                     """
+                    WITH weak_topic_tokens(token) AS (
+                        VALUES
+                            ('a'),
+                            ('about'),
+                            ('after'),
+                            ('all'),
+                            ('also'),
+                            ('am'),
+                            ('an'),
+                            ('and'),
+                            ('any'),
+                            ('are'),
+                            ('as'),
+                            ('at'),
+                            ('be'),
+                            ('because'),
+                            ('been'),
+                            ('before'),
+                            ('being'),
+                            ('but'),
+                            ('by'),
+                            ('can'),
+                            ('could'),
+                            ('did'),
+                            ('do'),
+                            ('does'),
+                            ('dont'),
+                            ('for'),
+                            ('from'),
+                            ('get'),
+                            ('got'),
+                            ('had'),
+                            ('has'),
+                            ('have'),
+                            ('here'),
+                            ('how'),
+                            ('i'),
+                            ('ill'),
+                            ('im'),
+                            ('in'),
+                            ('into'),
+                            ('is'),
+                            ('it'),
+                            ('its'),
+                            ('ive'),
+                            ('just'),
+                            ('like'),
+                            ('many'),
+                            ('may'),
+                            ('me'),
+                            ('might'),
+                            ('more'),
+                            ('most'),
+                            ('my'),
+                            ('need'),
+                            ('no'),
+                            ('not'),
+                            ('now'),
+                            ('of'),
+                            ('on'),
+                            ('one'),
+                            ('or'),
+                            ('our'),
+                            ('same'),
+                            ('she'),
+                            ('should'),
+                            ('so'),
+                            ('some'),
+                            ('still'),
+                            ('that'),
+                            ('the'),
+                            ('their'),
+                            ('them'),
+                            ('then'),
+                            ('there'),
+                            ('these'),
+                            ('they'),
+                            ('this'),
+                            ('those'),
+                            ('to'),
+                            ('today'),
+                            ('tomorrow'),
+                            ('us'),
+                            ('very'),
+                            ('was'),
+                            ('we'),
+                            ('were'),
+                            ('what'),
+                            ('when'),
+                            ('where'),
+                            ('which'),
+                            ('who'),
+                            ('why'),
+                            ('will'),
+                            ('with'),
+                            ('would'),
+                            ('you'),
+                            ('your')
+                    ),
+                    topic_mentions_raw AS (
+                        SELECT
+                            date_trunc(
+                                'minute',
+                                COALESCE(pt.bucket_minute, pp.bucket_minute, pp.created_at, pp.processed_at, now())
+                            ) AS bucket_minute,
+                            COALESCE(NULLIF(TRIM(pt.platform), ''), COALESCE(pp.platform, 'bluesky')) AS platform,
+                            CASE
+                                WHEN lower(regexp_replace(TRIM(COALESCE(pt.normalized_topic, '')), '\s+', ' ', 'g'))
+                                    IN ('nokings', 'no king', 'no kings', 'no kings''s', 'no kingss')
+                                    THEN 'no kings'
+                                ELSE lower(
+                                    regexp_replace(TRIM(COALESCE(pt.normalized_topic, '')), '\s+', ' ', 'g')
+                                )
+                            END AS normalized_topic,
+                            COALESCE(NULLIF(TRIM(pt.topic_text), ''), NULLIF(TRIM(pt.normalized_topic), '')) AS topic_text,
+                            pt.raw_post_id,
+                            COALESCE(pp.author_id, '') AS author_id,
+                            COALESCE(pp.quality_score, 0)::double precision AS quality_score,
+                            COALESCE(pp.is_repost, false) AS is_repost,
+                            COALESCE(pp.is_reply, false) AS is_reply,
+                            (COALESCE(array_length(pp.urls, 1), 0) > 0) AS has_link,
+                            CASE
+                                WHEN COALESCE(pp.sentiment_label, '') IN ('positive', 'negative', 'neutral')
+                                    THEN pp.sentiment_label
+                                ELSE 'neutral'
+                            END AS sentiment_label,
+                            CASE
+                                WHEN pt.topic_type = 'cashtag' THEN 1
+                                WHEN pt.topic_type = 'hashtag' THEN 2
+                                WHEN pt.topic_type = 'entity' THEN 3
+                                WHEN pt.topic_type = 'keyword' THEN 4
+                                ELSE 9
+                            END AS topic_priority
+                        FROM public.post_topics pt
+                        LEFT JOIN public.processed_posts pp
+                            ON pp.id = pt.processed_post_id
+                        WHERE COALESCE(pt.normalized_topic, '') <> ''
+                    ),
+                    topic_mentions AS (
+                        SELECT DISTINCT ON (raw_post_id, platform, normalized_topic)
+                            bucket_minute,
+                            platform,
+                            normalized_topic,
+                            topic_text,
+                            raw_post_id,
+                            author_id,
+                            quality_score,
+                            is_repost,
+                            is_reply,
+                            has_link,
+                            sentiment_label
+                        FROM topic_mentions_raw
+                        WHERE normalized_topic <> ''
+                          AND normalized_topic NOT IN ('all', 'general')
+                          AND normalized_topic NOT IN (SELECT token FROM weak_topic_tokens)
+                          AND length(replace(normalized_topic, ' ', '')) >= 2
+                        ORDER BY raw_post_id, platform, normalized_topic, topic_priority ASC, quality_score DESC
+                    ),
+                    fallback_mentions AS (
+                        SELECT
+                            date_trunc(
+                                'minute',
+                                COALESCE(pp.bucket_minute, pp.created_at, pp.processed_at, now())
+                            ) AS bucket_minute,
+                            COALESCE(pp.platform, 'bluesky') AS platform,
+                            CASE
+                                WHEN lower(regexp_replace(
+                                    TRIM(COALESCE(pp.topic, pp.topic_key_candidate, '')),
+                                    '\s+',
+                                    ' ',
+                                    'g'
+                                )) IN ('nokings', 'no king', 'no kings', 'no kings''s', 'no kingss')
+                                    THEN 'no kings'
+                                ELSE lower(
+                                    regexp_replace(
+                                        TRIM(COALESCE(pp.topic, pp.topic_key_candidate, '')),
+                                        '\s+',
+                                        ' ',
+                                        'g'
+                                    )
+                                )
+                            END AS normalized_topic,
+                            COALESCE(NULLIF(TRIM(pp.topic), ''), NULLIF(TRIM(pp.topic_key_candidate), '')) AS topic_text,
+                            pp.raw_post_id,
+                            COALESCE(pp.author_id, '') AS author_id,
+                            COALESCE(pp.quality_score, 0)::double precision AS quality_score,
+                            COALESCE(pp.is_repost, false) AS is_repost,
+                            COALESCE(pp.is_reply, false) AS is_reply,
+                            (COALESCE(array_length(pp.urls, 1), 0) > 0) AS has_link,
+                            CASE
+                                WHEN COALESCE(pp.sentiment_label, '') IN ('positive', 'negative', 'neutral')
+                                    THEN pp.sentiment_label
+                                ELSE 'neutral'
+                            END AS sentiment_label
+                        FROM public.processed_posts pp
+                        WHERE COALESCE(pp.topic, pp.topic_key_candidate, '') <> ''
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM public.post_topics pt
+                              WHERE pt.raw_post_id = pp.raw_post_id
+                          )
+                    ),
+                    all_mentions AS (
+                        SELECT * FROM topic_mentions
+                        UNION ALL
+                        SELECT * FROM fallback_mentions
+                    ),
+                    filtered_mentions AS (
+                        SELECT *
+                        FROM all_mentions
+                        WHERE normalized_topic <> ''
+                          AND normalized_topic NOT IN ('all', 'general')
+                          AND normalized_topic NOT IN (SELECT token FROM weak_topic_tokens)
+                          AND length(replace(normalized_topic, ' ', '')) >= 2
+                    ),
+                    aggregated AS (
+                        SELECT
+                            bucket_minute,
+                            platform,
+                            normalized_topic,
+                            COUNT(*)::INT AS mention_count,
+                            COUNT(DISTINCT NULLIF(author_id, ''))::INT AS unique_authors,
+                            COUNT(DISTINCT raw_post_id)::INT AS unique_posts,
+                            COALESCE(SUM(quality_score), 0)::numeric AS total_quality_score,
+                            COALESCE(AVG(quality_score), 0)::numeric AS avg_quality_score,
+                            SUM(CASE WHEN is_repost THEN 1 ELSE 0 END)::INT AS repost_count,
+                            SUM(CASE WHEN is_reply THEN 1 ELSE 0 END)::INT AS reply_count,
+                            SUM(CASE WHEN has_link THEN 1 ELSE 0 END)::INT AS link_post_count,
+                            SUM(CASE WHEN sentiment_label = 'positive' THEN 1 ELSE 0 END)::INT AS positive_count,
+                            SUM(CASE WHEN sentiment_label = 'negative' THEN 1 ELSE 0 END)::INT AS negative_count,
+                            SUM(CASE WHEN sentiment_label = 'neutral' THEN 1 ELSE 0 END)::INT AS neutral_count
+                        FROM filtered_mentions
+                        GROUP BY 1, 2, 3
+                    )
                     INSERT INTO public.topic_buckets_1m (
                         bucket_minute,
                         platform,
@@ -1612,28 +1885,52 @@ class PostgresStore:
                         sample_size,
                         created_at,
                         bucket_start,
-                        topic
+                        topic,
+                        normalized_topic,
+                        topic_display,
+                        unique_posts,
+                        positive_count,
+                        neutral_count,
+                        negative_count,
+                        sentiment_net,
+                        sentiment_score,
+                        updated_at
                     )
                     SELECT
-                        date_trunc('minute', created_at) AS bucket_minute,
+                        bucket_minute,
                         platform,
-                        COALESCE(topic, 'all') AS topic_key,
-                        COUNT(*)::INT AS mention_count,
-                        COUNT(DISTINCT author_id)::INT AS unique_authors,
-                        COALESCE(SUM(COALESCE(quality_score, 0)), 0)::numeric AS total_quality_score,
-                        COALESCE(AVG(COALESCE(quality_score, 0)), 0)::numeric AS avg_quality_score,
-                        SUM(CASE WHEN is_repost THEN 1 ELSE 0 END)::INT AS repost_count,
-                        SUM(CASE WHEN is_reply THEN 1 ELSE 0 END)::INT AS reply_count,
-                        SUM(CASE WHEN COALESCE(array_length(urls, 1), 0) > 0 THEN 1 ELSE 0 END)::INT AS link_post_count,
-                        COUNT(*)::INT AS sample_size,
+                        normalized_topic AS topic_key,
+                        mention_count,
+                        unique_authors,
+                        total_quality_score,
+                        avg_quality_score,
+                        repost_count,
+                        reply_count,
+                        link_post_count,
+                        mention_count AS sample_size,
                         now() AS created_at,
-                        date_trunc('minute', created_at) AS bucket_start,
-                        COALESCE(topic, 'all') AS topic
-                    FROM public.processed_posts
-                    WHERE created_at IS NOT NULL
-                      AND platform IS NOT NULL
-                      AND COALESCE(topic, 'all') <> ''
-                    GROUP BY 1, 2, 3
+                        bucket_minute AS bucket_start,
+                        CASE
+                            WHEN normalized_topic = 'no kings' THEN 'No Kings'
+                            ELSE INITCAP(normalized_topic)
+                        END AS topic,
+                        normalized_topic,
+                        CASE
+                            WHEN normalized_topic = 'no kings' THEN 'No Kings'
+                            ELSE INITCAP(normalized_topic)
+                        END AS topic_display,
+                        unique_posts,
+                        positive_count,
+                        neutral_count,
+                        negative_count,
+                        (positive_count - negative_count)::INT AS sentiment_net,
+                        CASE
+                            WHEN mention_count > 0 THEN
+                                ROUND(((positive_count - negative_count)::numeric / mention_count)::numeric, 4)::double precision
+                            ELSE 0::double precision
+                        END AS sentiment_score,
+                        now() AS updated_at
+                    FROM aggregated
                     """
                 )
                 return int(cursor.rowcount or 0)

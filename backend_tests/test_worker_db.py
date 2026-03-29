@@ -507,6 +507,7 @@ class WorkerDbTests(unittest.TestCase):
         self.assertGreaterEqual(affected, 1)
         queries = [str(query) for query, _params in fake_connection.execute_calls]
         aggregate_query = next(query for query in queries if "INSERT INTO public.topic_buckets_1m" in query)
+        self.assertIn("FROM public.post_topics", aggregate_query)
         self.assertIn("FROM public.processed_posts", aggregate_query)
         self.assertTrue(any("TRUNCATE TABLE public.topic_buckets_1m" in query for query in queries))
 

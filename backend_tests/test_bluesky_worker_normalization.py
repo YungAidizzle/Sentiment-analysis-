@@ -118,6 +118,23 @@ class BlueskyWorkerNormalizationTests(unittest.TestCase):
         self.assertIn("Kalshi", normalized_topics)
         self.assertNotIn("parent", [topic.lower() for topic in normalized_topics])
 
+    def test_extract_topic_entities_filters_weak_fragments_and_canonicalizes_aliases(self):
+        raw_row = {
+            "text_content": (
+                "I'm glad you asked. We should talk later. "
+                "Crowd heading to #NoKings today."
+            )
+        }
+
+        topics = extractTopicEntities(raw_row)
+        normalized_topics = [row["normalized_topic"] for row in topics]
+        normalized_lower = [topic.lower() for topic in normalized_topics]
+
+        self.assertIn("No Kings", normalized_topics)
+        self.assertNotIn("i'm", normalized_lower)
+        self.assertNotIn("you", normalized_lower)
+        self.assertNotIn("we", normalized_lower)
+
     def test_analyze_sentiment_applies_weighted_lexicon(self):
         sentiment = analyzeSentiment(
             clean_text="I love this but hate the bad execution, still ok overall.",
