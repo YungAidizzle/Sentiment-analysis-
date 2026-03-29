@@ -311,7 +311,6 @@ def main() -> int:
     run_status = "running"
     last_raw_cleanup_at_monotonic = 0.0
     last_topic_aggregate_at_monotonic = 0.0
-    pending_topic_aggregation = True
 
     stop_requested = False
 
@@ -360,13 +359,16 @@ def main() -> int:
             last_raw_cleanup_at_monotonic = now_monotonic
 
     def run_topic_aggregation_if_due(*, force: bool = False, reason: str) -> None:
-        nonlocal last_topic_aggregate_at_monotonic, pending_topic_aggregation
+        nonlocal last_topic_aggregate_at_monotonic
         if config.topic_aggregate_interval_seconds <= 0:
-            return
-        if not force and not pending_topic_aggregation:
             return
 
         now_monotonic = time.monotonic()
+        since_last_seconds = (
+            round(now_monotonic - last_topic_aggregate_at_monotonic, 3)
+            if last_topic_aggregate_at_monotonic > 0
+            else None
+        )
         if (
             not force
             and last_topic_aggregate_at_monotonic > 0
@@ -374,9 +376,11 @@ def main() -> int:
         ):
             return
 
+        started_monotonic = time.monotonic()
+        started_at = _utc_now().isoformat()
         try:
             topic_rows_affected = store.aggregate_topic_buckets_1m_from_processed_posts()
-            pending_topic_aggregation = False
+            duration_ms = round((time.monotonic() - started_monotonic) * 1000, 1)
             log_event(
                 logger,
                 logging.INFO,
@@ -385,8 +389,12 @@ def main() -> int:
                 reason=reason,
                 rows_affected=topic_rows_affected,
                 min_interval_seconds=config.topic_aggregate_interval_seconds,
+                duration_ms=duration_ms,
+                last_run_delta_seconds=since_last_seconds,
+                started_at=started_at,
             )
         except Exception as aggregation_error:
+            duration_ms = round((time.monotonic() - started_monotonic) * 1000, 1)
             log_event(
                 logger,
                 logging.ERROR,
@@ -395,9 +403,12 @@ def main() -> int:
                 reason=reason,
                 error=str(aggregation_error),
                 min_interval_seconds=config.topic_aggregate_interval_seconds,
+                duration_ms=duration_ms,
+                last_run_delta_seconds=since_last_seconds,
+                started_at=started_at,
             )
         finally:
-            last_topic_aggregate_at_monotonic = now_monotonic
+            last_topic_aggregate_at_monotonic = started_monotonic
 
     initial_notes = _build_run_notes(
         cycle=cycle,
@@ -447,6 +458,7 @@ def main() -> int:
                 break
 
             run_raw_cleanup_if_due()
+            run_topic_aggregation_if_due(reason="loop_tick")
 
             cycle += 1
             cycle_started = time.monotonic()
@@ -459,6 +471,7 @@ def main() -> int:
                 candidate_cursor = _parse_cursor(progress_state.get("cursor"))
                 if candidate_cursor is not None:
                     cursor_us = candidate_cursor
+                run_topic_aggregation_if_due(reason="firehose_progress")
 
                 elapsed = time.monotonic() - progress_written_at
                 if elapsed < config.progress_update_seconds:
@@ -560,7 +573,6 @@ def main() -> int:
                         )
                         if processed_result:
                             processed_posts += 1
-                            pending_topic_aggregation = True
                             post_topics_persisted += persistPostTopics(
                                 store=store,
                                 raw_row=ingested_raw,

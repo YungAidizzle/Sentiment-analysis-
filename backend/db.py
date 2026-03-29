@@ -1631,13 +1631,40 @@ class PostgresStore:
 
         return self._execute_write("refresh_processed_posts_from_raw_posts", operation)
 
-    def aggregate_topic_buckets_1m_from_processed_posts(self) -> int:
+    def aggregate_topic_buckets_1m_from_processed_posts(
+        self,
+        *,
+        lookback_hours: float = 30.0,
+        retention_hours: float = 192.0,
+    ) -> int:
+        recompute_lookback_hours = max(1.0, float(lookback_hours))
+        stale_retention_hours = max(recompute_lookback_hours, float(retention_hours))
+
         def operation(connection: psycopg.Connection[Any]) -> int:
             with connection.cursor() as cursor:
-                cursor.execute("TRUNCATE TABLE public.topic_buckets_1m")
                 cursor.execute(
                     """
-                    WITH weak_topic_tokens(token) AS (
+                    WITH aggregation_bounds AS (
+                        SELECT date_trunc('minute', now() - (%s * interval '1 hour')) AS recompute_from
+                    )
+                    DELETE FROM public.topic_buckets_1m
+                    WHERE bucket_minute >= (SELECT recompute_from FROM aggregation_bounds)
+                    """,
+                    (recompute_lookback_hours,),
+                )
+                cursor.execute(
+                    """
+                    DELETE FROM public.topic_buckets_1m
+                    WHERE bucket_minute < date_trunc('minute', now() - (%s * interval '1 hour'))
+                    """,
+                    (stale_retention_hours,),
+                )
+                cursor.execute(
+                    """
+                    WITH aggregation_bounds AS (
+                        SELECT date_trunc('minute', now() - (%s * interval '1 hour')) AS recompute_from
+                    ),
+                    weak_topic_tokens(token) AS (
                         VALUES
                             ('a'),
                             ('about'),
@@ -1920,11 +1947,22 @@ class PostgresStore:
                             ) AS bucket_minute,
                             COALESCE(NULLIF(TRIM(pt.platform), ''), COALESCE(pp.platform, 'bluesky')) AS platform,
                             CASE
-                                WHEN lower(regexp_replace(TRIM(COALESCE(pt.normalized_topic, '')), '\s+', ' ', 'g'))
-                                    IN ('nokings', 'no king', 'no kings', 'no kings''s', 'no kingss')
+                                WHEN btrim(
+                                    regexp_replace(
+                                        regexp_replace(lower(COALESCE(pt.normalized_topic, '')), '[^a-z0-9$#\\s]+', ' ', 'g'),
+                                        '\\s+',
+                                        ' ',
+                                        'g'
+                                    )
+                                ) IN ('nokings', 'no king', 'no kings', 'no kings s', 'no kingss')
                                     THEN 'no kings'
-                                ELSE lower(
-                                    regexp_replace(TRIM(COALESCE(pt.normalized_topic, '')), '\s+', ' ', 'g')
+                                ELSE btrim(
+                                    regexp_replace(
+                                        regexp_replace(lower(COALESCE(pt.normalized_topic, '')), '[^a-z0-9$#\\s]+', ' ', 'g'),
+                                        '\\s+',
+                                        ' ',
+                                        'g'
+                                    )
                                 )
                             END AS normalized_topic,
                             COALESCE(NULLIF(TRIM(pt.topic_text), ''), NULLIF(TRIM(pt.normalized_topic), '')) AS topic_text,
@@ -1950,6 +1988,10 @@ class PostgresStore:
                         LEFT JOIN public.processed_posts pp
                             ON pp.id = pt.processed_post_id
                         WHERE COALESCE(pt.normalized_topic, '') <> ''
+                          AND date_trunc(
+                              'minute',
+                              COALESCE(pt.bucket_minute, pp.bucket_minute, pp.created_at, pp.processed_at, now())
+                          ) >= (SELECT recompute_from FROM aggregation_bounds)
                     ),
                     topic_mentions AS (
                         SELECT DISTINCT ON (raw_post_id, platform, normalized_topic)
@@ -1963,7 +2005,8 @@ class PostgresStore:
                             is_repost,
                             is_reply,
                             has_link,
-                            sentiment_label
+                            sentiment_label,
+                            false AS from_fallback
                         FROM topic_mentions_raw
                         WHERE normalized_topic <> ''
                           AND normalized_topic NOT IN ('all', 'general')
@@ -1979,17 +2022,29 @@ class PostgresStore:
                             ) AS bucket_minute,
                             COALESCE(pp.platform, 'bluesky') AS platform,
                             CASE
-                                WHEN lower(regexp_replace(
-                                    TRIM(COALESCE(pp.topic, pp.topic_key_candidate, '')),
-                                    '\s+',
-                                    ' ',
-                                    'g'
-                                )) IN ('nokings', 'no king', 'no kings', 'no kings''s', 'no kingss')
-                                    THEN 'no kings'
-                                ELSE lower(
+                                WHEN btrim(
                                     regexp_replace(
-                                        TRIM(COALESCE(pp.topic, pp.topic_key_candidate, '')),
-                                        '\s+',
+                                        regexp_replace(
+                                            lower(COALESCE(pp.topic, pp.topic_key_candidate, '')),
+                                            '[^a-z0-9$#\\s]+',
+                                            ' ',
+                                            'g'
+                                        ),
+                                        '\\s+',
+                                        ' ',
+                                        'g'
+                                    )
+                                ) IN ('nokings', 'no king', 'no kings', 'no kings s', 'no kingss')
+                                    THEN 'no kings'
+                                ELSE btrim(
+                                    regexp_replace(
+                                        regexp_replace(
+                                            lower(COALESCE(pp.topic, pp.topic_key_candidate, '')),
+                                            '[^a-z0-9$#\\s]+',
+                                            ' ',
+                                            'g'
+                                        ),
+                                        '\\s+',
                                         ' ',
                                         'g'
                                     )
@@ -2006,9 +2061,14 @@ class PostgresStore:
                                 WHEN COALESCE(pp.sentiment_label, '') IN ('positive', 'negative', 'neutral')
                                     THEN pp.sentiment_label
                                 ELSE 'neutral'
-                            END AS sentiment_label
+                            END AS sentiment_label,
+                            true AS from_fallback
                         FROM public.processed_posts pp
                         WHERE COALESCE(pp.topic, pp.topic_key_candidate, '') <> ''
+                          AND date_trunc(
+                              'minute',
+                              COALESCE(pp.bucket_minute, pp.created_at, pp.processed_at, now())
+                          ) >= (SELECT recompute_from FROM aggregation_bounds)
                           AND NOT EXISTS (
                               SELECT 1
                               FROM public.post_topics pt
@@ -2027,6 +2087,11 @@ class PostgresStore:
                           AND normalized_topic NOT IN ('all', 'general')
                           AND normalized_topic NOT IN (SELECT token FROM weak_topic_tokens)
                           AND length(replace(normalized_topic, ' ', '')) >= 2
+                          AND (
+                              from_fallback = false
+                              OR POSITION(' ' IN normalized_topic) > 0
+                              OR normalized_topic IN (SELECT token FROM single_word_topic_allowlist)
+                          )
                           AND EXISTS (
                               SELECT 1
                               FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
@@ -2053,16 +2118,27 @@ class PostgresStore:
                         FROM filtered_mentions
                         GROUP BY 1, 2, 3
                     ),
+                    topic_totals AS (
+                        SELECT
+                            platform,
+                            normalized_topic,
+                            SUM(mention_count)::INT AS total_mentions
+                        FROM aggregated
+                        GROUP BY 1, 2
+                    ),
                     filtered_aggregated AS (
                         SELECT aggregated.*
                         FROM aggregated
+                        JOIN topic_totals
+                          ON topic_totals.platform = aggregated.platform
+                         AND topic_totals.normalized_topic = aggregated.normalized_topic
                         CROSS JOIN single_word_topic_minimum
                         WHERE
                             POSITION(' ' IN aggregated.normalized_topic) > 0
                             OR aggregated.normalized_topic IN (
                                 SELECT token FROM single_word_topic_allowlist
                             )
-                            OR aggregated.mention_count >= single_word_topic_minimum.min_mentions
+                            OR topic_totals.total_mentions >= single_word_topic_minimum.min_mentions
                     )
                     INSERT INTO public.topic_buckets_1m (
                         bucket_minute,
@@ -2124,7 +2200,29 @@ class PostgresStore:
                         END AS sentiment_score,
                         now() AS updated_at
                     FROM filtered_aggregated
+                    ON CONFLICT (bucket_minute, platform, topic_key) DO UPDATE
+                    SET mention_count = EXCLUDED.mention_count,
+                        unique_authors = EXCLUDED.unique_authors,
+                        total_quality_score = EXCLUDED.total_quality_score,
+                        avg_quality_score = EXCLUDED.avg_quality_score,
+                        repost_count = EXCLUDED.repost_count,
+                        reply_count = EXCLUDED.reply_count,
+                        link_post_count = EXCLUDED.link_post_count,
+                        sample_size = EXCLUDED.sample_size,
+                        bucket_start = EXCLUDED.bucket_start,
+                        topic = EXCLUDED.topic,
+                        normalized_topic = EXCLUDED.normalized_topic,
+                        topic_display = EXCLUDED.topic_display,
+                        unique_posts = EXCLUDED.unique_posts,
+                        positive_count = EXCLUDED.positive_count,
+                        neutral_count = EXCLUDED.neutral_count,
+                        negative_count = EXCLUDED.negative_count,
+                        sentiment_net = EXCLUDED.sentiment_net,
+                        sentiment_score = EXCLUDED.sentiment_score,
+                        updated_at = EXCLUDED.updated_at
                     """
+                    ,
+                    (recompute_lookback_hours,),
                 )
                 return int(cursor.rowcount or 0)
 
