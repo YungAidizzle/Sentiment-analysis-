@@ -1885,6 +1885,33 @@ class PostgresStore:
                             ('you'),
                             ('your')
                     ),
+                    single_word_topic_allowlist(token) AS (
+                        VALUES
+                            ('ai'),
+                            ('america'),
+                            ('biden'),
+                            ('bitcoin'),
+                            ('btc'),
+                            ('china'),
+                            ('crypto'),
+                            ('ethereum'),
+                            ('eth'),
+                            ('eu'),
+                            ('gaza'),
+                            ('iran'),
+                            ('israel'),
+                            ('maga'),
+                            ('palestine'),
+                            ('russia'),
+                            ('solana'),
+                            ('trump'),
+                            ('uk'),
+                            ('ukraine'),
+                            ('usa')
+                    ),
+                    single_word_topic_minimum(min_mentions) AS (
+                        VALUES (18)
+                    ),
                     topic_mentions_raw AS (
                         SELECT
                             date_trunc(
@@ -2000,6 +2027,12 @@ class PostgresStore:
                           AND normalized_topic NOT IN ('all', 'general')
                           AND normalized_topic NOT IN (SELECT token FROM weak_topic_tokens)
                           AND length(replace(normalized_topic, ' ', '')) >= 2
+                          AND EXISTS (
+                              SELECT 1
+                              FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
+                              WHERE topic_token.token <> ''
+                                AND topic_token.token NOT IN (SELECT token FROM weak_topic_tokens)
+                          )
                     ),
                     aggregated AS (
                         SELECT
@@ -2019,6 +2052,17 @@ class PostgresStore:
                             SUM(CASE WHEN sentiment_label = 'neutral' THEN 1 ELSE 0 END)::INT AS neutral_count
                         FROM filtered_mentions
                         GROUP BY 1, 2, 3
+                    ),
+                    filtered_aggregated AS (
+                        SELECT aggregated.*
+                        FROM aggregated
+                        CROSS JOIN single_word_topic_minimum
+                        WHERE
+                            POSITION(' ' IN aggregated.normalized_topic) > 0
+                            OR aggregated.normalized_topic IN (
+                                SELECT token FROM single_word_topic_allowlist
+                            )
+                            OR aggregated.mention_count >= single_word_topic_minimum.min_mentions
                     )
                     INSERT INTO public.topic_buckets_1m (
                         bucket_minute,
@@ -2079,7 +2123,7 @@ class PostgresStore:
                             ELSE 0::double precision
                         END AS sentiment_score,
                         now() AS updated_at
-                    FROM aggregated
+                    FROM filtered_aggregated
                     """
                 )
                 return int(cursor.rowcount or 0)
