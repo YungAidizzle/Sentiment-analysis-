@@ -514,8 +514,11 @@ class WorkerDbTests(unittest.TestCase):
         self.assertIn("('social')", aggregate_query)
         self.assertIn("single_word_topic_allowlist", aggregate_query)
         self.assertIn("single_word_topic_minimum", aggregate_query)
+        self.assertIn("aggregation_bounds", aggregate_query)
+        self.assertIn("ON CONFLICT (bucket_minute, platform, topic_key) DO UPDATE", aggregate_query)
+        self.assertIn("from_fallback = false", aggregate_query)
         self.assertIn("POSITION(' ' IN aggregated.normalized_topic) > 0", aggregate_query)
-        self.assertTrue(any("TRUNCATE TABLE public.topic_buckets_1m" in query for query in queries))
+        self.assertTrue(any("DELETE FROM public.topic_buckets_1m" in query for query in queries))
 
 
 if __name__ == "__main__":

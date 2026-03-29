@@ -62,7 +62,7 @@ class WorkerConfig:
         batch_size = _parse_int_env("BLUESKY_DB_BATCH_SIZE", 200, minimum=1)
         configured_firehose_window_max_seconds = _parse_int_env(
             "BLUESKY_WORKER_FIREHOSE_MAX_SECONDS_PER_CYCLE",
-            12,
+            8,
             minimum=1,
         )
         configured_firehose_window_max_events = _parse_int_env(
