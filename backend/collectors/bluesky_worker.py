@@ -123,6 +123,52 @@ TOPIC_GARBAGE_PHRASE_PATTERNS = (
     re.compile(r"\b[a-z0-9]+bot\b", re.IGNORECASE),
 )
 
+TOPIC_NUMBER_WORD_TOKENS = {
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+    "twenty",
+    "thirty",
+    "forty",
+    "fifty",
+    "sixty",
+    "seventy",
+    "eighty",
+    "ninety",
+    "hundred",
+    "thousand",
+    "million",
+    "billion",
+    "trillion",
+    "first",
+    "second",
+    "third",
+    "fourth",
+    "fifth",
+    "sixth",
+    "seventh",
+    "eighth",
+    "ninth",
+    "tenth",
+}
+
 WEAK_TOPIC_TOKENS = {
     "a",
     "about",
@@ -664,15 +710,23 @@ def _is_garbage_topic_phrase(value: str, *, topic_type: str) -> bool:
 
     noise_count = sum(1 for token in tokens if token in TOPIC_NOISE_TOKENS)
     weak_count = sum(1 for token in tokens if token in WEAK_TOPIC_TOKENS)
+    number_word_count = sum(1 for token in tokens if token in TOPIC_NUMBER_WORD_TOKENS)
     informative_count = sum(
         1
         for token in tokens
         if token not in WEAK_TOPIC_TOKENS
         and token not in TOPIC_NOISE_TOKENS
+        and token not in TOPIC_NUMBER_WORD_TOKENS
         and (len(token) >= 4 or token in TOPIC_ACRONYM_EXCEPTIONS)
     )
 
     if len(tokens) == 1 and tokens[0] in TOPIC_NOISE_TOKENS:
+        return True
+    if len(tokens) == 1 and tokens[0] in TOPIC_NUMBER_WORD_TOKENS:
+        return True
+    if number_word_count == len(tokens):
+        return True
+    if topic_type in {"entity", "keyword"} and len(tokens) >= 2 and number_word_count >= (len(tokens) - 1):
         return True
     if noise_count >= max(2, len(tokens) - 1):
         return True
@@ -694,6 +748,8 @@ def _is_high_signal_keyword_token(value: str) -> bool:
     if token in STOPWORD_TOKENS or token in TOPIC_BLOCKLIST:
         return False
     if token in WEAK_TOPIC_TOKENS or token in TOPIC_NOISE_TOKENS:
+        return False
+    if token in TOPIC_NUMBER_WORD_TOKENS:
         return False
     if len(token) < 4:
         return False
@@ -719,6 +775,8 @@ def _is_weak_topic_phrase(value: str, *, topic_type: str) -> bool:
     if len(tokens) == 1:
         token = tokens[0]
         if token in WEAK_TOPIC_TOKENS or token in TOPIC_NOISE_TOKENS:
+            return True
+        if token in TOPIC_NUMBER_WORD_TOKENS:
             return True
         if len(token) < 3 and token not in TOPIC_ACRONYM_EXCEPTIONS:
             return True
@@ -821,6 +879,8 @@ def _is_valid_topic_candidate(value: str, *, topic_type: str) -> bool:
     if normalized.isdigit():
         return False
     if normalized_lower in TOPIC_BLOCKLIST:
+        return False
+    if len(tokens) == 1 and tokens[0] in TOPIC_NUMBER_WORD_TOKENS:
         return False
     if len(tokens) == 1 and tokens[0] in TOPIC_NOISE_TOKENS:
         return False

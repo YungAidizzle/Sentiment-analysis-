@@ -7,6 +7,8 @@ from backend.env import load_repo_env
 
 load_repo_env()
 
+MIN_RAW_RETENTION_HOURS_FOR_24H_TRENDS = 30.0
+
 
 def _parse_int_env(name: str, default: int, *, minimum: int) -> int:
     raw = os.getenv(name, str(default)).strip()
@@ -36,6 +38,11 @@ class WorkerConfig:
     loop_sleep_seconds: float
     retry_seconds: float
     topic_aggregate_interval_seconds: float
+    topic_fact_sync_lookback_hours: int
+    topic_read_model_lag_minutes: int
+    topic_read_model_recompute_hours: int
+    topic_read_model_series_max_topics: int
+    topic_read_model_series_min_mentions: int
     progress_update_seconds: float
     raw_retention_hours: float
     raw_cleanup_interval_seconds: float
@@ -85,6 +92,31 @@ class WorkerConfig:
             20.0,
             minimum=0.0,
         )
+        topic_fact_sync_lookback_hours = _parse_int_env(
+            "BLUESKY_TOPIC_FACT_SYNC_LOOKBACK_HOURS",
+            72,
+            minimum=1,
+        )
+        topic_read_model_lag_minutes = _parse_int_env(
+            "BLUESKY_TOPIC_READ_MODEL_LAG_MINUTES",
+            3,
+            minimum=1,
+        )
+        topic_read_model_recompute_hours = _parse_int_env(
+            "BLUESKY_TOPIC_READ_MODEL_RECOMPUTE_HOURS",
+            48,
+            minimum=1,
+        )
+        topic_read_model_series_max_topics = _parse_int_env(
+            "BLUESKY_TOPIC_READ_MODEL_SERIES_MAX_TOPICS",
+            300,
+            minimum=25,
+        )
+        topic_read_model_series_min_mentions = _parse_int_env(
+            "BLUESKY_TOPIC_READ_MODEL_SERIES_MIN_MENTIONS",
+            2,
+            minimum=1,
+        )
         progress_update_seconds = _parse_float_env(
             "BLUESKY_WORKER_PROGRESS_UPDATE_SECONDS",
             15.0,
@@ -92,7 +124,7 @@ class WorkerConfig:
         )
         raw_retention_hours = _parse_float_env(
             "BLUESKY_RAW_RETENTION_HOURS",
-            1.0,
+            MIN_RAW_RETENTION_HOURS_FOR_24H_TRENDS,
             minimum=0.0,
         )
         raw_cleanup_interval_seconds = _parse_float_env(
@@ -130,8 +162,16 @@ class WorkerConfig:
                 if topic_aggregate_interval_seconds is not None
                 else configured_topic_aggregate_interval_seconds,
             ),
+            topic_fact_sync_lookback_hours=topic_fact_sync_lookback_hours,
+            topic_read_model_lag_minutes=topic_read_model_lag_minutes,
+            topic_read_model_recompute_hours=topic_read_model_recompute_hours,
+            topic_read_model_series_max_topics=topic_read_model_series_max_topics,
+            topic_read_model_series_min_mentions=topic_read_model_series_min_mentions,
             progress_update_seconds=progress_update_seconds,
-            raw_retention_hours=raw_retention_hours,
+            raw_retention_hours=max(
+                MIN_RAW_RETENTION_HOURS_FOR_24H_TRENDS,
+                raw_retention_hours,
+            ),
             raw_cleanup_interval_seconds=raw_cleanup_interval_seconds,
             log_level=log_level,
         )

@@ -233,6 +233,7 @@ def main() -> int:
     try:
         store.verify_connection()
         store.ensure_processed_topic_tables()
+        store.ensure_stable_topic_read_model_tables()
         disabled_jobs = store.disable_legacy_topic_bucket_refresh_jobs()
         if disabled_jobs > 0:
             log_event(
@@ -257,13 +258,32 @@ def main() -> int:
         try:
             store.ensure_metric_bucket_tables()
             store.ensure_processed_topic_tables()
+            store.ensure_stable_topic_read_model_tables()
             rows_1m = 0
             rows_1h = 0
             processed_rows = 0
             topic_rows_1m = 0
+            stable_fact_rows = 0
+            stable_cleanup_rows = 0
+            stable_refresh: dict[str, Any] | None = None
             if args.aggregate_1m:
                 processed_rows = store.refresh_processed_posts_from_raw_posts()
                 topic_rows_1m = store.aggregate_topic_buckets_1m_from_processed_posts()
+                stable_fact_rows = store.sync_post_topic_mentions_from_post_topics(
+                    lookback_hours=config.topic_fact_sync_lookback_hours,
+                )
+                stable_cleanup_rows = store.cleanup_garbage_post_topic_mentions(
+                    lookback_hours=max(
+                        config.topic_fact_sync_lookback_hours,
+                        config.topic_read_model_recompute_hours,
+                    ),
+                )
+                stable_refresh = store.refresh_stable_topic_read_models(
+                    lag_minutes=config.topic_read_model_lag_minutes,
+                    recompute_hours=config.topic_read_model_recompute_hours,
+                    series_max_topics=config.topic_read_model_series_max_topics,
+                    series_min_mentions=config.topic_read_model_series_min_mentions,
+                )
                 rows_1m = store.aggregate_metric_buckets_1m()
                 log_event(
                     logger,
@@ -273,6 +293,9 @@ def main() -> int:
                     rows_affected=rows_1m,
                     processed_rows_affected=processed_rows,
                     topic_rows_affected=topic_rows_1m,
+                    stable_fact_rows=stable_fact_rows,
+                    stable_cleanup_rows=stable_cleanup_rows,
+                    stable_refresh=stable_refresh,
                 )
             if args.aggregate_1h:
                 rows_1h = store.aggregate_metric_buckets_1h()
@@ -294,6 +317,9 @@ def main() -> int:
                 rows_1h=rows_1h,
                 processed_rows=processed_rows,
                 topic_rows_1m=topic_rows_1m,
+                stable_fact_rows=stable_fact_rows,
+                stable_cleanup_rows=stable_cleanup_rows,
+                stable_refresh=stable_refresh,
             )
             store.close()
             return 0
@@ -389,6 +415,21 @@ def main() -> int:
         started_at = _utc_now().isoformat()
         try:
             topic_rows_affected = store.aggregate_topic_buckets_1m_from_processed_posts()
+            stable_fact_rows = store.sync_post_topic_mentions_from_post_topics(
+                lookback_hours=config.topic_fact_sync_lookback_hours,
+            )
+            stable_cleanup_rows = store.cleanup_garbage_post_topic_mentions(
+                lookback_hours=max(
+                    config.topic_fact_sync_lookback_hours,
+                    config.topic_read_model_recompute_hours,
+                ),
+            )
+            stable_refresh = store.refresh_stable_topic_read_models(
+                lag_minutes=config.topic_read_model_lag_minutes,
+                recompute_hours=config.topic_read_model_recompute_hours,
+                series_max_topics=config.topic_read_model_series_max_topics,
+                series_min_mentions=config.topic_read_model_series_min_mentions,
+            )
             duration_ms = round((time.monotonic() - started_monotonic) * 1000, 1)
             log_event(
                 logger,
@@ -397,6 +438,9 @@ def main() -> int:
                 cycle=cycle,
                 reason=reason,
                 rows_affected=topic_rows_affected,
+                stable_fact_rows=stable_fact_rows,
+                stable_cleanup_rows=stable_cleanup_rows,
+                stable_refresh=stable_refresh,
                 min_interval_seconds=config.topic_aggregate_interval_seconds,
                 duration_ms=duration_ms,
                 last_run_delta_seconds=since_last_seconds,
@@ -453,6 +497,11 @@ def main() -> int:
         firehose_window_max_seconds=config.firehose_window_max_seconds,
         firehose_window_max_events=config.firehose_window_max_events,
         topic_aggregate_interval_seconds=config.topic_aggregate_interval_seconds,
+        topic_fact_sync_lookback_hours=config.topic_fact_sync_lookback_hours,
+        topic_read_model_lag_minutes=config.topic_read_model_lag_minutes,
+        topic_read_model_recompute_hours=config.topic_read_model_recompute_hours,
+        topic_read_model_series_max_topics=config.topic_read_model_series_max_topics,
+        topic_read_model_series_min_mentions=config.topic_read_model_series_min_mentions,
         raw_retention_hours=config.raw_retention_hours,
         raw_cleanup_interval_seconds=config.raw_cleanup_interval_seconds,
     )
