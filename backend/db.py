@@ -1060,22 +1060,28 @@ class PostgresStore:
                         """,
                     ),
                 )
-                for view_name, select_query in view_definitions:
+                for view_index, (view_name, select_query) in enumerate(view_definitions):
+                    savepoint_name = f"topic_view_replace_{view_index}"
                     create_or_replace_view_sql = (
                         f"CREATE OR REPLACE VIEW public.{view_name} AS {select_query}"
                     )
+                    cursor.execute(f"SAVEPOINT {savepoint_name}")
                     try:
                         cursor.execute(create_or_replace_view_sql)
                     except psycopg.Error as error:
-                        if "cannot change name of view column" not in str(error).lower():
+                        cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+                        if "cannot change name of view column" in str(error).lower():
+                            self._logger.warning(
+                                "recreating_view_after_column_rename_error view=%s error=%s",
+                                view_name,
+                                error,
+                            )
+                            cursor.execute(f"DROP VIEW IF EXISTS public.{view_name}")
+                            cursor.execute(f"CREATE VIEW public.{view_name} AS {select_query}")
+                        else:
                             raise
-                        self._logger.warning(
-                            "recreating_view_after_column_rename_error view=%s error=%s",
-                            view_name,
-                            error,
-                        )
-                        cursor.execute(f"DROP VIEW IF EXISTS public.{view_name}")
-                        cursor.execute(f"CREATE VIEW public.{view_name} AS {select_query}")
+                    finally:
+                        cursor.execute(f"RELEASE SAVEPOINT {savepoint_name}")
 
         self._execute_write("ensure_stable_topic_read_model_tables", operation)
 
