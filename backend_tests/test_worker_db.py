@@ -548,8 +548,18 @@ class WorkerDbTests(unittest.TestCase):
         self.assertIn("single_word_topic_minimum", aggregate_query)
         self.assertIn("aggregation_bounds", aggregate_query)
         self.assertIn("ON CONFLICT (bucket_minute, platform, topic_key) DO UPDATE", aggregate_query)
-        self.assertIn("from_fallback = false", aggregate_query)
-        self.assertIn("POSITION(' ' IN aggregated.normalized_topic) > 0", aggregate_query)
+        self.assertIn("array_length(string_to_array(normalized_topic, ' '), 1) = 2", aggregate_query)
+        self.assertIn("array_length(string_to_array(aggregated.normalized_topic, ' '), 1) = 2", aggregate_query)
+        self.assertIn("pt.bucket_minute", aggregate_query)
+        self.assertIn("pp.bucket_minute", aggregate_query)
+        self.assertIn("pp.source_created_at", aggregate_query)
+        self.assertIn("pp.created_at", aggregate_query)
+        self.assertIn("pp.processed_at", aggregate_query)
+        self.assertTrue(
+            aggregate_query.index("pt.bucket_minute")
+            < aggregate_query.index("pp.processed_at"),
+            "bucket/source timestamps should be prioritized before processed_at for timeline correctness",
+        )
         self.assertTrue(any("DELETE FROM public.topic_buckets_1m" in query for query in queries))
 
 
