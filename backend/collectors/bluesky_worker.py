@@ -792,6 +792,160 @@ def _is_high_signal_keyword_token(value: str) -> bool:
     return confidence >= 0.62
 
 
+def _is_informative_topic_token(value: str) -> bool:
+    token = normalize_topic_key_text(value)
+    if not token:
+        return False
+    if token in TOPIC_URL_DEBRIS_TOKENS:
+        return False
+    if token in TOPIC_NOISE_TOKENS:
+        return False
+    if token in TOPIC_NUMBER_WORD_TOKENS:
+        return False
+    if token in WEAK_TOPIC_TOKENS and token not in TOPIC_ACRONYM_EXCEPTIONS:
+        return False
+    if token in TOPIC_ACRONYM_EXCEPTIONS:
+        return True
+    if token in TOPIC_ENTITY_ALLOWLIST:
+        return True
+    if token in WEAK_TOPIC_TOKENS:
+        return False
+    return len(token) >= 4 and not token.isdigit()
+
+
+def _topic_token_priority(value: str) -> int:
+    token = normalize_topic_key_text(value)
+    if not token:
+        return 0
+    if token in WEAK_TOPIC_TOKENS and token not in TOPIC_ACRONYM_EXCEPTIONS:
+        return 0
+    if token in TOPIC_ENTITY_ALLOWLIST or token in TOPIC_ACRONYM_EXCEPTIONS:
+        return 3
+    if _is_high_signal_keyword_token(token):
+        return 2
+    if _is_informative_topic_token(token):
+        return 1
+    return 0
+
+
+def _format_topic_token(value: str) -> str:
+    token = normalize_topic_key_text(value)
+    if not token:
+        return ""
+    if token in TOPIC_ACRONYM_EXCEPTIONS:
+        return token.upper()
+    if "-" in token:
+        return "-".join(part[:1].upper() + part[1:] for part in token.split("-") if part)
+    return token[:1].upper() + token[1:]
+
+
+def _to_two_keyword_topic(
+    value: str,
+    *,
+    topic_type: str,
+    context_tokens: List[str],
+) -> str:
+    normalized_topic = _normalize_topic_value(value, topic_type=topic_type)
+    if not normalized_topic:
+        return ""
+
+    canonical_key, _canonical_label, _alias_confidence = canonicalize_topic_key(
+        normalize_topic_key_text(normalized_topic)
+    )
+    canonical_tokens = _topic_tokens(canonical_key or normalized_topic)
+    if len(canonical_tokens) == 2:
+        canonical_pair_key = " ".join(canonical_tokens)
+        canonical_alias = TOPIC_CANONICAL_ALIASES.get(canonical_pair_key)
+        if canonical_alias and len(_topic_tokens(canonical_alias)) == 2:
+            return canonical_alias
+        return " ".join(_format_topic_token(token) for token in canonical_tokens).strip()
+
+    base_tokens = canonical_tokens
+    normalized_context = [
+        normalize_topic_key_text(token)
+        for token in context_tokens
+        if normalize_topic_key_text(token)
+    ]
+
+    selected_tokens: list[str] = []
+    for token in base_tokens:
+        if token in selected_tokens:
+            continue
+        if not _is_informative_topic_token(token):
+            continue
+        selected_tokens.append(token)
+        if len(selected_tokens) >= 2:
+            break
+
+    if len(selected_tokens) < 2:
+        for token in base_tokens:
+            if token in selected_tokens:
+                continue
+            if (
+                token in TOPIC_URL_DEBRIS_TOKENS
+                or token in TOPIC_NOISE_TOKENS
+                or token in TOPIC_NUMBER_WORD_TOKENS
+                or token in WEAK_TOPIC_TOKENS
+            ):
+                continue
+            selected_tokens.append(token)
+            if len(selected_tokens) >= 2:
+                break
+
+    while len(selected_tokens) < 2:
+        best_token = ""
+        best_priority = -1
+        for token in normalized_context:
+            if token in selected_tokens:
+                continue
+            priority = _topic_token_priority(token)
+            if priority > best_priority:
+                best_priority = priority
+                best_token = token
+                if priority >= 3:
+                    break
+        if best_token:
+            selected_tokens.append(best_token)
+            continue
+        fallback_token = ""
+        for token in normalized_context:
+            if token in selected_tokens:
+                continue
+            if (
+                token in TOPIC_URL_DEBRIS_TOKENS
+                or token in TOPIC_NOISE_TOKENS
+                or token in TOPIC_NUMBER_WORD_TOKENS
+                or token in WEAK_TOPIC_TOKENS
+            ):
+                continue
+            fallback_token = token
+            break
+        if fallback_token:
+            selected_tokens.append(fallback_token)
+            continue
+        break
+
+    if len(selected_tokens) < 2:
+        return normalized_topic
+
+    pair_tokens = selected_tokens[:2]
+    context_positions: dict[str, int] = {}
+    for index, token in enumerate(normalized_context):
+        if token not in context_positions:
+            context_positions[token] = index
+    if len(pair_tokens) == 2:
+        pair_tokens = sorted(
+            pair_tokens,
+            key=lambda token: context_positions.get(token, 10_000),
+        )
+
+    pair_key = " ".join(pair_tokens).strip()
+    alias = TOPIC_CANONICAL_ALIASES.get(pair_key)
+    if alias and len(_topic_tokens(alias)) == 2:
+        return alias
+    return " ".join(_format_topic_token(token) for token in pair_tokens).strip()
+
+
 def _is_weak_topic_phrase(value: str, *, topic_type: str) -> bool:
     tokens = _topic_tokens(value)
     if not tokens:
@@ -1010,10 +1164,20 @@ def _infer_topic_key_candidate(
     tokens: List[str],
     tags: List[str],
 ) -> str:
+    context_tokens = _dedupe_text(
+        normalize_topic_key_text(token)
+        for token in tokens
+        if normalize_topic_key_text(token)
+    )
     if hashtags:
         for hashtag in hashtags:
-            if _is_valid_topic_candidate(f"#{hashtag}", topic_type="hashtag"):
-                return _normalize_topic_value(f"#{hashtag}", topic_type="hashtag")
+            candidate = _to_two_keyword_topic(
+                f"#{hashtag}",
+                topic_type="hashtag",
+                context_tokens=context_tokens,
+            )
+            if _is_valid_topic_candidate(candidate, topic_type="entity"):
+                return candidate
     prioritized = [
         token
         for token in tokens
@@ -1021,7 +1185,26 @@ def _infer_topic_key_candidate(
         and _is_valid_topic_candidate(token, topic_type="keyword")
     ]
     if prioritized:
-        return _normalize_topic_value(prioritized[0], topic_type="keyword")
+        candidate = _to_two_keyword_topic(
+            prioritized[0],
+            topic_type="keyword",
+            context_tokens=context_tokens,
+        )
+        if _is_valid_topic_candidate(candidate, topic_type="entity"):
+            return candidate
+    informative_context = [
+        token
+        for token in context_tokens
+        if _is_informative_topic_token(token)
+    ]
+    if len(informative_context) >= 2:
+        candidate = _to_two_keyword_topic(
+            " ".join(informative_context[:2]),
+            topic_type="entity",
+            context_tokens=context_tokens,
+        )
+        if _is_valid_topic_candidate(candidate, topic_type="entity"):
+            return candidate
     return "general"
 
 
@@ -1180,9 +1363,14 @@ def extractTopicEntities(raw_post: Dict[str, Any]) -> List[Dict[str, str]]:
     candidates: list[dict[str, str]] = []
     seen_normalized: set[str] = set()
     source_quality = float(raw_post.get("quality_score") or 0.0)
+    context_tokens = _extract_tokens(text_content)
 
     def add_candidate(topic_text: str, topic_type: str) -> None:
-        normalized_topic = _normalize_topic_value(topic_text, topic_type=topic_type)
+        normalized_topic = _to_two_keyword_topic(
+            topic_text,
+            topic_type=topic_type,
+            context_tokens=context_tokens,
+        )
         normalized_key = normalize_topic_key_text(normalized_topic)
         if not _is_valid_topic_candidate(normalized_topic, topic_type=topic_type):
             return

@@ -106,6 +106,7 @@ TOPIC_GENERIC_WEAK_TOKENS = {
     "by",
     "can",
     "cant",
+    "cest",
     "come",
     "could",
     "couldnt",

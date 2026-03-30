@@ -1332,7 +1332,7 @@ class PostgresStore:
                           AND topic_key !~* '(area|forecast|discussion).*(afd|airnow|aqi)'
                           AND topic_key !~* '(additional|details) here'
                           AND number_count < token_count
-                          AND informative_count = 2
+                          AND informative_count >= 1
                           AND url_count = 0
                           AND topic_confidence >= CASE
                               WHEN topic_type = 'cashtag' THEN 0.34

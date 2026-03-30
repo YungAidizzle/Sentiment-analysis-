@@ -115,6 +115,10 @@ class BlueskyWorkerNormalizationTests(unittest.TestCase):
         self.assertIn("dropshipping", features["tags"])
         self.assertEqual(processed["raw_post_id"], 99)
         self.assertEqual(processed["topic_key_candidate"], processed["topic"])
+        self.assertEqual(
+            len([token for token in processed["topic_key_candidate"].split(" ") if token]),
+            2,
+        )
         self.assertEqual(processed["mentions"], ["alice"])
         self.assertEqual(processed["domains"], ["example.com"])
         self.assertIn("sentiment_label", processed)
@@ -130,12 +134,18 @@ class BlueskyWorkerNormalizationTests(unittest.TestCase):
 
         topics = extractTopicEntities(raw_row)
         normalized_topics = [row["normalized_topic"] for row in topics]
+        normalized_token_sets = [
+            {token for token in topic.lower().split(" ") if token}
+            for topic in normalized_topics
+        ]
 
-        self.assertIn("NYSE", normalized_topics)
-        self.assertIn("Polymarket", normalized_topics)
-        self.assertIn("ICE", normalized_topics)
-        self.assertIn("Kalshi", normalized_topics)
-        self.assertNotIn("parent", [topic.lower() for topic in normalized_topics])
+        self.assertTrue(normalized_topics)
+        self.assertTrue(all(len(tokens) == 2 for tokens in normalized_token_sets))
+        self.assertTrue(any("nyse" in tokens for tokens in normalized_token_sets))
+        self.assertTrue(any("polymarket" in tokens for tokens in normalized_token_sets))
+        self.assertTrue(any("ice" in tokens for tokens in normalized_token_sets))
+        self.assertTrue(any("kalshi" in tokens for tokens in normalized_token_sets))
+        self.assertFalse(any(tokens == {"parent"} for tokens in normalized_token_sets))
 
     def test_extract_topic_entities_filters_weak_fragments_and_canonicalizes_aliases(self):
         raw_row = {
@@ -150,6 +160,7 @@ class BlueskyWorkerNormalizationTests(unittest.TestCase):
         normalized_lower = [topic.lower() for topic in normalized_topics]
 
         self.assertIn("No Kings", normalized_topics)
+        self.assertTrue(all(len(topic.split(" ")) == 2 for topic in normalized_topics))
         self.assertNotIn("i'm", normalized_lower)
         self.assertNotIn("you", normalized_lower)
         self.assertNotIn("we", normalized_lower)
@@ -164,16 +175,17 @@ class BlueskyWorkerNormalizationTests(unittest.TestCase):
 
         topics = extractTopicEntities(raw_row)
         normalized_topics = [row["normalized_topic"] for row in topics]
-        normalized_lower = [topic.lower() for topic in normalized_topics]
+        normalized_token_sets = [
+            {token for token in topic.lower().split(" ") if token}
+            for topic in normalized_topics
+        ]
 
         self.assertIn("No Kings", normalized_topics)
-        self.assertIn("Trump", normalized_topics)
-        self.assertIn("Iran", normalized_topics)
-        self.assertNotIn("thank", normalized_lower)
-        self.assertNotIn("bluesky", normalized_lower)
-        self.assertNotIn("feed", normalized_lower)
-        self.assertNotIn("love", normalized_lower)
-        self.assertNotIn("social", normalized_lower)
+        self.assertTrue(any("trump" in tokens for tokens in normalized_token_sets))
+        self.assertTrue(any("iran" in tokens for tokens in normalized_token_sets))
+        self.assertTrue(all(len(tokens) == 2 for tokens in normalized_token_sets))
+        for weak_token in ("thank", "bluesky", "feed", "love", "social"):
+            self.assertFalse(any(weak_token in tokens for tokens in normalized_token_sets))
 
     def test_extract_topic_entities_rejects_feed_artifact_fragments(self):
         raw_row = {
@@ -185,15 +197,19 @@ class BlueskyWorkerNormalizationTests(unittest.TestCase):
 
         topics = extractTopicEntities(raw_row)
         normalized_topics = [row["normalized_topic"] for row in topics]
-        normalized_lower = [topic.lower() for topic in normalized_topics]
+        normalized_token_sets = [
+            {token for token in topic.lower().split(" ") if token}
+            for topic in normalized_topics
+        ]
 
-        self.assertIn("Trump", normalized_topics)
-        self.assertIn("Polymarket", normalized_topics)
-        self.assertIn("NYSE", normalized_topics)
-        self.assertIn("DJT", normalized_topics)
-        self.assertNotIn("iembot additional details here", normalized_lower)
-        self.assertNotIn("area forecast discussion afd at mar", normalized_lower)
-        self.assertNotIn("prelim airnow aqi", normalized_lower)
+        self.assertTrue(any("trump" in tokens for tokens in normalized_token_sets))
+        self.assertTrue(any("polymarket" in tokens for tokens in normalized_token_sets))
+        self.assertTrue(any("nyse" in tokens for tokens in normalized_token_sets))
+        self.assertTrue(any("djt" in tokens for tokens in normalized_token_sets))
+        self.assertTrue(all(len(tokens) == 2 for tokens in normalized_token_sets))
+        self.assertFalse(any("iembot" in tokens for tokens in normalized_token_sets))
+        self.assertFalse(any("airnow" in tokens for tokens in normalized_token_sets))
+        self.assertFalse(any("afd" in tokens for tokens in normalized_token_sets))
 
     def test_extract_topic_entities_filters_foreign_function_word_fragments(self):
         raw_row = {
@@ -204,13 +220,16 @@ class BlueskyWorkerNormalizationTests(unittest.TestCase):
 
         topics = extractTopicEntities(raw_row)
         normalized_topics = [row["normalized_topic"] for row in topics]
-        normalized_lower = [topic.lower() for topic in normalized_topics]
+        normalized_token_sets = [
+            {token for token in topic.lower().split(" ") if token}
+            for topic in normalized_topics
+        ]
 
-        self.assertIn("Trump", normalized_topics)
         self.assertIn("No Kings", normalized_topics)
-        self.assertNotIn("de", normalized_lower)
-        self.assertNotIn("ich", normalized_lower)
-        self.assertNotIn("c est", normalized_lower)
+        self.assertTrue(any("trump" in tokens for tokens in normalized_token_sets))
+        self.assertTrue(all(len(tokens) == 2 for tokens in normalized_token_sets))
+        self.assertFalse(any("de" in tokens for tokens in normalized_token_sets))
+        self.assertFalse(any("ich" in tokens for tokens in normalized_token_sets))
 
     def test_analyze_sentiment_applies_weighted_lexicon(self):
         sentiment = analyzeSentiment(
