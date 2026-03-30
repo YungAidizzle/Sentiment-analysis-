@@ -1272,12 +1272,6 @@ def extractTopicEntities(raw_post: Dict[str, Any]) -> List[Dict[str, str]]:
                 break
             if next_lower in TOPIC_NOISE_TOKENS or next_lower in TOPIC_URL_DEBRIS_TOKENS:
                 break
-            # Keep adjacent proper-like tokens together so names like "Donald Trump"
-            # can be emitted as two-keyword entities instead of split singletons.
-            if _is_proper_like_token(next_token):
-                grouped_tokens.append(next_token)
-                cursor += 1
-                continue
             if (
                 next_lower in TOPIC_CONNECTOR_WORDS
                 and (cursor + 1) < len(phrase_tokens)

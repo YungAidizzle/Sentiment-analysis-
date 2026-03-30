@@ -1325,14 +1325,28 @@ class PostgresStore:
                           AND topic_key NOT IN ('all', 'general', 'digit')
                           AND NOT (topic_text_lc LIKE 'digit:%%in words:%%')
                           AND length(replace(topic_key, ' ', '')) >= 2
-                          AND token_count = 2
+                          AND token_count BETWEEN 1 AND 5
                           AND topic_key !~ '^[0-9]+$'
                           AND topic_key !~* '(^| )(https?|www|com|co|t|ly|amp)( |$)'
                           AND topic_key !~* '(^| )([a-z0-9]+bot)( |$)'
                           AND topic_key !~* '(area|forecast|discussion).*(afd|airnow|aqi)'
                           AND topic_key !~* '(additional|details) here'
+                          AND (
+                              token_count > 1
+                              OR (
+                                  topic_key NOT IN (SELECT token FROM weak_topic_tokens)
+                                  AND topic_key NOT IN (SELECT token FROM topic_noise_tokens)
+                                  AND topic_key NOT IN (SELECT token FROM number_word_tokens)
+                                  AND topic_key NOT IN (SELECT token FROM url_debris_tokens)
+                                  AND (
+                                      length(topic_key) >= 4
+                                      OR topic_key IN (SELECT token FROM acronym_allowlist)
+                                      OR topic_type IN ('cashtag', 'hashtag')
+                                  )
+                              )
+                          )
                           AND number_count < token_count
-                          AND informative_count = 2
+                          AND informative_count > 0
                           AND url_count = 0
                           AND topic_confidence >= CASE
                               WHEN topic_type = 'cashtag' THEN 0.34
@@ -1484,7 +1498,6 @@ class PostgresStore:
                   ON t.topic_key = b.topic_key
                 WHERE (b.bucket_minute AT TIME ZONE 'utc')::date = %s::date
                 GROUP BY b.topic_key, COALESCE(t.canonical_label, INITCAP(b.topic_key))
-                HAVING SUM(b.mention_count) >= 2
                 """,
                 (day_value, day_value),
             )
@@ -1624,7 +1637,6 @@ class PostgresStore:
                   AND m.event_timestamp < %s::timestamptz
                   AND COALESCE(m.topic_confidence, 0) >= 0.34
                 GROUP BY m.topic_key, t.canonical_label
-                HAVING COUNT(*) >= 2
                 """,
                 (window_start, window_end, window_start, window_end),
             )
@@ -1810,7 +1822,6 @@ class PostgresStore:
                         WHERE m.event_timestamp >= now() - make_interval(hours => %s)
                           AND (
                               COALESCE(TRIM(m.topic_key), '') = ''
-                              OR COALESCE(array_length(string_to_array(LOWER(m.topic_key), ' '), 1), 0) <> 2
                               OR LOWER(m.topic_key) IN ('all', 'general', 'digit')
                               OR COALESCE(m.topic_confidence, 0) < 0.20
                               OR LOWER(m.topic_key) ~* '(^| )([a-z0-9]+bot)( |$)'
@@ -3290,7 +3301,7 @@ class PostgresStore:
                           AND normalized_topic NOT IN ('all', 'general')
                           AND normalized_topic NOT IN (SELECT token FROM weak_topic_tokens)
                           AND length(replace(normalized_topic, ' ', '')) >= 2
-                          AND array_length(string_to_array(normalized_topic, ' '), 1) = 2
+                          AND array_length(string_to_array(normalized_topic, ' '), 1) <= 4
                           AND NOT EXISTS (
                               SELECT 1
                               FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
@@ -3385,7 +3396,7 @@ class PostgresStore:
                           AND normalized_topic NOT IN ('all', 'general')
                           AND normalized_topic NOT IN (SELECT token FROM weak_topic_tokens)
                           AND length(replace(normalized_topic, ' ', '')) >= 2
-                          AND array_length(string_to_array(normalized_topic, ' '), 1) = 2
+                          AND array_length(string_to_array(normalized_topic, ' '), 1) <= 4
                           AND NOT EXISTS (
                               SELECT 1
                               FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
@@ -3395,6 +3406,21 @@ class PostgresStore:
                           AND normalized_topic !~* '(^| )([a-z0-9]+bot)( |$)'
                           AND normalized_topic !~* '(area|forecast|discussion).*(afd|airnow|aqi)'
                           AND normalized_topic !~* '(additional|details) here'
+                          AND (
+                              from_fallback = false
+                              OR normalized_topic IN (SELECT token FROM single_word_topic_allowlist)
+                              OR (
+                                  POSITION(' ' IN normalized_topic) > 0
+                                  AND (
+                                      SELECT COUNT(*)
+                                      FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
+                                      WHERE topic_token.token <> ''
+                                        AND topic_token.token NOT IN (SELECT token FROM weak_topic_tokens)
+                                        AND topic_token.token NOT IN (SELECT token FROM topic_noise_tokens)
+                                        AND length(topic_token.token) >= 4
+                                  ) >= 2
+                              )
+                          )
                           AND (
                               SELECT COUNT(*)
                               FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
@@ -3412,6 +3438,7 @@ class PostgresStore:
                                 AND topic_token.token NOT IN (SELECT token FROM topic_noise_tokens)
                                 AND (
                                     length(topic_token.token) >= 4
+                                    OR topic_token.token IN (SELECT token FROM single_word_topic_allowlist)
                                 )
                           )
                     ),
@@ -3450,8 +3477,18 @@ class PostgresStore:
                           ON topic_totals.platform = aggregated.platform
                          AND topic_totals.normalized_topic = aggregated.normalized_topic
                         CROSS JOIN single_word_topic_minimum
-                        WHERE array_length(string_to_array(aggregated.normalized_topic, ' '), 1) = 2
-                          AND topic_totals.total_mentions >= 2
+                        WHERE
+                            POSITION(' ' IN aggregated.normalized_topic) > 0
+                            OR aggregated.best_topic_priority <= 3
+                            OR (
+                                aggregated.best_topic_priority <= 4
+                                AND topic_totals.total_mentions >= 6
+                                AND aggregated.avg_quality_score >= 0.40
+                            )
+                            OR aggregated.normalized_topic IN (
+                                SELECT token FROM single_word_topic_allowlist
+                            )
+                            OR topic_totals.total_mentions >= single_word_topic_minimum.min_mentions
                     )
                     INSERT INTO public.topic_buckets_1m (
                         bucket_minute,
