@@ -1001,63 +1001,81 @@ class PostgresStore:
                     ON public.topic_day_series_5m (day, topic_key, bucket_5m)
                     """
                 )
-                cursor.execute(
-                    """
-                    CREATE OR REPLACE VIEW public.v_topic_leaderboard_day AS
-                    SELECT
-                        day,
-                        topic_key,
-                        topic_label,
-                        platform_count,
-                        total_mentions,
-                        unique_posts,
-                        unique_authors,
-                        positive_count,
-                        neutral_count,
-                        negative_count,
-                        avg_topic_confidence,
-                        first_seen_at,
-                        last_seen_at,
-                        updated_at
-                    FROM public.topic_day_totals
-                    """
+                view_definitions = (
+                    (
+                        "v_topic_leaderboard_day",
+                        """
+                        SELECT
+                            day,
+                            topic_key,
+                            topic_label,
+                            platform_count,
+                            total_mentions,
+                            unique_posts,
+                            unique_authors,
+                            positive_count,
+                            neutral_count,
+                            negative_count,
+                            avg_topic_confidence,
+                            first_seen_at,
+                            last_seen_at,
+                            updated_at
+                        FROM public.topic_day_totals
+                        """,
+                    ),
+                    (
+                        "v_topic_series_day_5m",
+                        """
+                        SELECT
+                            day,
+                            bucket_5m,
+                            topic_key,
+                            topic_label,
+                            interactions,
+                            cumulative_interactions,
+                            updated_at
+                        FROM public.topic_day_series_5m
+                        """,
+                    ),
+                    (
+                        "v_topic_leaderboard_rolling_24h",
+                        """
+                        SELECT
+                            topic_key,
+                            topic_label,
+                            platform_count,
+                            total_mentions,
+                            unique_posts,
+                            unique_authors,
+                            positive_count,
+                            neutral_count,
+                            negative_count,
+                            avg_topic_confidence,
+                            first_seen_at,
+                            last_seen_at,
+                            window_start,
+                            window_end,
+                            updated_at
+                        FROM public.topic_rolling_24h
+                        """,
+                    ),
                 )
-                cursor.execute(
-                    """
-                    CREATE OR REPLACE VIEW public.v_topic_series_day_5m AS
-                    SELECT
-                        day,
-                        bucket_5m,
-                        topic_key,
-                        topic_label,
-                        interactions,
-                        cumulative_interactions,
-                        updated_at
-                    FROM public.topic_day_series_5m
-                    """
-                )
-                cursor.execute(
-                    """
-                    CREATE OR REPLACE VIEW public.v_topic_leaderboard_rolling_24h AS
-                    SELECT
-                        topic_key,
-                        topic_label,
-                        platform_count,
-                        total_mentions,
-                        unique_posts,
-                        unique_authors,
-                        positive_count,
-                        neutral_count,
-                        negative_count,
-                        avg_topic_confidence,
-                        first_seen_at,
-                        last_seen_at,
-                        window_start,
-                        window_end,
-                        updated_at
-                    FROM public.topic_rolling_24h
-                    """
-                )
+                for view_name, select_query in view_definitions:
+                    create_or_replace_view_sql = (
+                        f"CREATE OR REPLACE VIEW public.{view_name} AS {select_query}"
+                    )
+                    try:
+                        cursor.execute(create_or_replace_view_sql)
+                    except psycopg.Error as error:
+                        if "cannot change name of view column" not in str(error).lower():
+                            raise
+                        self._logger.warning(
+                            "recreating_view_after_column_rename_error view=%s error=%s",
+                            view_name,
+                            error,
+                        )
+                        cursor.execute(f"DROP VIEW IF EXISTS public.{view_name}")
+                        cursor.execute(f"CREATE VIEW public.{view_name} AS {select_query}")
 
         self._execute_write("ensure_stable_topic_read_model_tables", operation)
 
