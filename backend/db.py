@@ -107,8 +107,15 @@ class PostgresStore:
                     WHERE active = TRUE
                       AND (
                           jobname = 'topic_buckets_refresh_every_minute'
+                          OR jobname = 'refresh_topic_read_models'
+                          OR jobname = 'refresh_topic_buckets_1m_final'
+                          OR jobname = 'refresh_topic_day_series_5m'
                           OR command ILIKE '%%run_topic_bucket_refresh_job%%'
                           OR command ILIKE '%%refresh_topic_buckets_1m%%'
+                          OR command ILIKE '%%refresh_topic_read_models%%'
+                          OR command ILIKE '%%refresh_topic_buckets_1m_final%%'
+                          OR command ILIKE '%%refresh_topic_day_series_5m%%'
+                          OR command ILIKE '%%refresh_topic_day_totals%%'
                       )
                     ORDER BY jobid ASC
                     """
@@ -243,37 +250,80 @@ class PostgresStore:
         stale_after_minutes = max(5, int(stale_after_minutes))
         source_value = str(source or "").strip() or "bluesky_firehose_worker"
         lock_key = _worker_lock_key(source_value)
+        global_lock_key = _worker_lock_key("bluesky_firehose_worker_singleton")
 
         def operation(connection: psycopg.Connection[Any]) -> dict[str, Any]:
             with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_lock(%s)", (global_lock_key,))
+                global_acquired = bool((cursor.fetchone() or [False])[0])
+                if not global_acquired:
+                    return {
+                        "acquired": False,
+                        "lock_key": lock_key,
+                        "global_lock_key": global_lock_key,
+                        "closed_stale_runs": 0,
+                        "closed_open_runs": 0,
+                    }
+
                 cursor.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
                 acquired = bool((cursor.fetchone() or [False])[0])
-                closed_stale_runs = 0
-                if acquired:
-                    cursor.execute(
-                        """
-                        WITH stale AS (
-                            UPDATE public.ingestion_runs r
-                            SET ended_at = now(),
-                                status = CASE
-                                    WHEN COALESCE(NULLIF(TRIM(r.status), ''), 'running') = 'running'
-                                        THEN 'abandoned'
-                                    ELSE r.status
-                                END
-                            WHERE r.source = %s
-                              AND r.ended_at IS NULL
-                              AND r.started_at < now() - make_interval(mins => %s)
-                            RETURNING 1
-                        )
-                        SELECT COUNT(*)::bigint FROM stale
-                        """,
-                        (source_value, stale_after_minutes),
+                if not acquired:
+                    cursor.execute("SELECT pg_advisory_unlock(%s)", (global_lock_key,))
+                    return {
+                        "acquired": False,
+                        "lock_key": lock_key,
+                        "global_lock_key": global_lock_key,
+                        "closed_stale_runs": 0,
+                        "closed_open_runs": 0,
+                    }
+
+                cursor.execute(
+                    """
+                    WITH stale AS (
+                        UPDATE public.ingestion_runs r
+                        SET ended_at = now(),
+                            status = CASE
+                                WHEN COALESCE(NULLIF(TRIM(r.status), ''), 'running') = 'running'
+                                    THEN 'abandoned'
+                                ELSE r.status
+                            END
+                        WHERE r.source = %s
+                          AND r.ended_at IS NULL
+                          AND r.started_at < now() - make_interval(mins => %s)
+                        RETURNING 1
                     )
-                    closed_stale_runs = int((cursor.fetchone() or [0])[0] or 0)
+                    SELECT COUNT(*)::bigint FROM stale
+                    """,
+                    (source_value, stale_after_minutes),
+                )
+                closed_stale_runs = int((cursor.fetchone() or [0])[0] or 0)
+
+                cursor.execute(
+                    """
+                    WITH open_runs AS (
+                        UPDATE public.ingestion_runs r
+                        SET ended_at = now(),
+                            status = CASE
+                                WHEN COALESCE(NULLIF(TRIM(r.status), ''), 'running') = 'running'
+                                    THEN 'abandoned'
+                                ELSE r.status
+                            END
+                        WHERE r.source = %s
+                          AND r.ended_at IS NULL
+                        RETURNING 1
+                    )
+                    SELECT COUNT(*)::bigint FROM open_runs
+                    """,
+                    (source_value,),
+                )
+                closed_open_runs = int((cursor.fetchone() or [0])[0] or 0)
+
                 return {
-                    "acquired": acquired,
+                    "acquired": True,
                     "lock_key": lock_key,
+                    "global_lock_key": global_lock_key,
                     "closed_stale_runs": closed_stale_runs,
+                    "closed_open_runs": closed_open_runs,
                 }
 
         return self._execute_write("acquire_worker_lease", operation)
@@ -281,11 +331,16 @@ class PostgresStore:
     def release_worker_lease(self, *, source: str) -> bool:
         source_value = str(source or "").strip() or "bluesky_firehose_worker"
         lock_key = _worker_lock_key(source_value)
+        global_lock_key = _worker_lock_key("bluesky_firehose_worker_singleton")
 
         def operation(connection: psycopg.Connection[Any]) -> bool:
             with connection.cursor() as cursor:
+                released_any = False
                 cursor.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
-                return bool((cursor.fetchone() or [False])[0])
+                released_any = released_any or bool((cursor.fetchone() or [False])[0])
+                cursor.execute("SELECT pg_advisory_unlock(%s)", (global_lock_key,))
+                released_any = released_any or bool((cursor.fetchone() or [False])[0])
+                return released_any
 
         return self._execute_write("release_worker_lease", operation)
 
@@ -1377,7 +1432,6 @@ class PostgresStore:
                           AND topic_key NOT IN ('all', 'general', 'digit')
                           AND NOT (topic_text_lc LIKE 'digit:%%in words:%%')
                           AND length(replace(topic_key, ' ', '')) >= 2
-                          AND token_count = 2
                           AND topic_key !~ '^[0-9]+$'
                           AND topic_key !~* '(^| )(https?|www|com|co|t|ly|amp)( |$)'
                           AND topic_key !~* '(^| )([a-z0-9]+bot)( |$)'
@@ -2193,7 +2247,6 @@ class PostgresStore:
                         WHERE m.event_timestamp >= now() - make_interval(hours => %s)
                           AND (
                               COALESCE(TRIM(m.topic_key), '') = ''
-                              OR COALESCE(array_length(string_to_array(LOWER(m.topic_key), ' '), 1), 0) <> 2
                               OR LOWER(m.topic_key) IN ('all', 'general', 'digit')
                               OR COALESCE(m.topic_confidence, 0) < 0.20
                               OR LOWER(m.topic_key) ~* '(^| )([a-z0-9]+bot)( |$)'
@@ -3559,32 +3612,6 @@ class PostgresStore:
                             ('statement'),
                             ('update')
                     ),
-                    single_word_topic_allowlist(token) AS (
-                        VALUES
-                            ('america'),
-                            ('biden'),
-                            ('bitcoin'),
-                            ('btc'),
-                            ('china'),
-                            ('crypto'),
-                            ('ethereum'),
-                            ('eth'),
-                            ('eu'),
-                            ('gaza'),
-                            ('iran'),
-                            ('israel'),
-                            ('maga'),
-                            ('palestine'),
-                            ('russia'),
-                            ('solana'),
-                            ('trump'),
-                            ('uk'),
-                            ('ukraine'),
-                            ('usa')
-                    ),
-                    single_word_topic_minimum(min_mentions) AS (
-                        VALUES (18)
-                    ),
                     topic_mentions_raw AS (
                         SELECT
                             date_trunc(
@@ -3673,7 +3700,6 @@ class PostgresStore:
                           AND normalized_topic NOT IN ('all', 'general')
                           AND normalized_topic NOT IN (SELECT token FROM weak_topic_tokens)
                           AND length(replace(normalized_topic, ' ', '')) >= 2
-                          AND array_length(string_to_array(normalized_topic, ' '), 1) = 2
                           AND NOT EXISTS (
                               SELECT 1
                               FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
@@ -3768,7 +3794,6 @@ class PostgresStore:
                           AND normalized_topic NOT IN ('all', 'general')
                           AND normalized_topic NOT IN (SELECT token FROM weak_topic_tokens)
                           AND length(replace(normalized_topic, ' ', '')) >= 2
-                          AND array_length(string_to_array(normalized_topic, ' '), 1) = 2
                           AND NOT EXISTS (
                               SELECT 1
                               FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
@@ -3832,9 +3857,7 @@ class PostgresStore:
                         JOIN topic_totals
                           ON topic_totals.platform = aggregated.platform
                          AND topic_totals.normalized_topic = aggregated.normalized_topic
-                        CROSS JOIN single_word_topic_minimum
-                        WHERE array_length(string_to_array(aggregated.normalized_topic, ' '), 1) = 2
-                          AND topic_totals.total_mentions >= 2
+                        WHERE topic_totals.total_mentions >= 2
                     )
                     INSERT INTO public.topic_buckets_1m (
                         bucket_minute,

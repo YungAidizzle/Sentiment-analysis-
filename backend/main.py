@@ -182,7 +182,7 @@ def parse_args() -> argparse.Namespace:
         "--topic-aggregate-interval-seconds",
         type=float,
         default=None,
-        help="Minimum seconds between topic_buckets_1m refreshes. Set 0 to disable.",
+        help="Minimum seconds between stable topic read-model refreshes. Set 0 to disable.",
     )
     parser.add_argument(
         "--topic-cleanup-interval-seconds",
@@ -205,7 +205,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--aggregate-1m",
         action="store_true",
-        help="Aggregate raw_posts into metric_buckets_1m and exit.",
+        help="Refresh 1m metric buckets + stable topic read models once and exit.",
     )
     parser.add_argument(
         "--aggregate-1h",
@@ -272,13 +272,11 @@ def main() -> int:
             rows_1m = 0
             rows_1h = 0
             processed_rows = 0
-            topic_rows_1m = 0
             stable_fact_rows = 0
             stable_cleanup_rows = 0
             stable_refresh: dict[str, Any] | None = None
             if args.aggregate_1m:
                 processed_rows = store.refresh_processed_posts_from_raw_posts()
-                topic_rows_1m = store.aggregate_topic_buckets_1m_from_processed_posts()
                 stable_fact_rows = store.sync_post_topic_mentions_from_post_topics(
                     lookback_hours=config.topic_fact_sync_lookback_hours,
                 )
@@ -302,7 +300,6 @@ def main() -> int:
                     source=source,
                     rows_affected=rows_1m,
                     processed_rows_affected=processed_rows,
-                    topic_rows_affected=topic_rows_1m,
                     stable_fact_rows=stable_fact_rows,
                     stable_cleanup_rows=stable_cleanup_rows,
                     stable_refresh=stable_refresh,
@@ -326,7 +323,6 @@ def main() -> int:
                 rows_1m=rows_1m,
                 rows_1h=rows_1h,
                 processed_rows=processed_rows,
-                topic_rows_1m=topic_rows_1m,
                 stable_fact_rows=stable_fact_rows,
                 stable_cleanup_rows=stable_cleanup_rows,
                 stable_refresh=stable_refresh,
@@ -437,7 +433,6 @@ def main() -> int:
             or (started_monotonic - last_topic_cleanup_at_monotonic) >= cleanup_interval_seconds
         )
         try:
-            topic_rows_affected = store.aggregate_topic_buckets_1m_from_processed_posts()
             stable_fact_rows = store.sync_post_topic_mentions_from_post_topics(
                 lookback_hours=config.topic_fact_sync_lookback_hours,
             )
@@ -463,7 +458,6 @@ def main() -> int:
                 "topic_aggregation_complete",
                 cycle=cycle,
                 reason=reason,
-                rows_affected=topic_rows_affected,
                 stable_fact_rows=stable_fact_rows,
                 stable_cleanup_rows=stable_cleanup_rows,
                 cleanup_due=cleanup_due,
@@ -590,6 +584,7 @@ def main() -> int:
             source=source,
             stale_after_minutes=config.worker_stale_run_minutes,
             closed_stale_runs=int(lease.get("closed_stale_runs") or 0),
+            closed_open_runs=int(lease.get("closed_open_runs") or 0),
         )
 
         store.create_ingestion_run(
