@@ -107,8 +107,15 @@ class PostgresStore:
                     WHERE active = TRUE
                       AND (
                           jobname = 'topic_buckets_refresh_every_minute'
+                          OR jobname = 'refresh_topic_read_models'
+                          OR jobname = 'refresh_topic_buckets_1m_final'
+                          OR jobname = 'refresh_topic_day_series_5m'
                           OR command ILIKE '%%run_topic_bucket_refresh_job%%'
                           OR command ILIKE '%%refresh_topic_buckets_1m%%'
+                          OR command ILIKE '%%refresh_topic_read_models%%'
+                          OR command ILIKE '%%refresh_topic_buckets_1m_final%%'
+                          OR command ILIKE '%%refresh_topic_day_series_5m%%'
+                          OR command ILIKE '%%refresh_topic_day_totals%%'
                       )
                     ORDER BY jobid ASC
                     """
@@ -243,37 +250,80 @@ class PostgresStore:
         stale_after_minutes = max(5, int(stale_after_minutes))
         source_value = str(source or "").strip() or "bluesky_firehose_worker"
         lock_key = _worker_lock_key(source_value)
+        global_lock_key = _worker_lock_key("bluesky_firehose_worker_singleton")
 
         def operation(connection: psycopg.Connection[Any]) -> dict[str, Any]:
             with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_lock(%s)", (global_lock_key,))
+                global_acquired = bool((cursor.fetchone() or [False])[0])
+                if not global_acquired:
+                    return {
+                        "acquired": False,
+                        "lock_key": lock_key,
+                        "global_lock_key": global_lock_key,
+                        "closed_stale_runs": 0,
+                        "closed_open_runs": 0,
+                    }
+
                 cursor.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
                 acquired = bool((cursor.fetchone() or [False])[0])
-                closed_stale_runs = 0
-                if acquired:
-                    cursor.execute(
-                        """
-                        WITH stale AS (
-                            UPDATE public.ingestion_runs r
-                            SET ended_at = now(),
-                                status = CASE
-                                    WHEN COALESCE(NULLIF(TRIM(r.status), ''), 'running') = 'running'
-                                        THEN 'abandoned'
-                                    ELSE r.status
-                                END
-                            WHERE r.source = %s
-                              AND r.ended_at IS NULL
-                              AND r.started_at < now() - make_interval(mins => %s)
-                            RETURNING 1
-                        )
-                        SELECT COUNT(*)::bigint FROM stale
-                        """,
-                        (source_value, stale_after_minutes),
+                if not acquired:
+                    cursor.execute("SELECT pg_advisory_unlock(%s)", (global_lock_key,))
+                    return {
+                        "acquired": False,
+                        "lock_key": lock_key,
+                        "global_lock_key": global_lock_key,
+                        "closed_stale_runs": 0,
+                        "closed_open_runs": 0,
+                    }
+
+                cursor.execute(
+                    """
+                    WITH stale AS (
+                        UPDATE public.ingestion_runs r
+                        SET ended_at = now(),
+                            status = CASE
+                                WHEN COALESCE(NULLIF(TRIM(r.status), ''), 'running') = 'running'
+                                    THEN 'abandoned'
+                                ELSE r.status
+                            END
+                        WHERE r.source = %s
+                          AND r.ended_at IS NULL
+                          AND r.started_at < now() - make_interval(mins => %s)
+                        RETURNING 1
                     )
-                    closed_stale_runs = int((cursor.fetchone() or [0])[0] or 0)
+                    SELECT COUNT(*)::bigint FROM stale
+                    """,
+                    (source_value, stale_after_minutes),
+                )
+                closed_stale_runs = int((cursor.fetchone() or [0])[0] or 0)
+
+                cursor.execute(
+                    """
+                    WITH open_runs AS (
+                        UPDATE public.ingestion_runs r
+                        SET ended_at = now(),
+                            status = CASE
+                                WHEN COALESCE(NULLIF(TRIM(r.status), ''), 'running') = 'running'
+                                    THEN 'abandoned'
+                                ELSE r.status
+                            END
+                        WHERE r.source = %s
+                          AND r.ended_at IS NULL
+                        RETURNING 1
+                    )
+                    SELECT COUNT(*)::bigint FROM open_runs
+                    """,
+                    (source_value,),
+                )
+                closed_open_runs = int((cursor.fetchone() or [0])[0] or 0)
+
                 return {
-                    "acquired": acquired,
+                    "acquired": True,
                     "lock_key": lock_key,
+                    "global_lock_key": global_lock_key,
                     "closed_stale_runs": closed_stale_runs,
+                    "closed_open_runs": closed_open_runs,
                 }
 
         return self._execute_write("acquire_worker_lease", operation)
@@ -281,11 +331,16 @@ class PostgresStore:
     def release_worker_lease(self, *, source: str) -> bool:
         source_value = str(source or "").strip() or "bluesky_firehose_worker"
         lock_key = _worker_lock_key(source_value)
+        global_lock_key = _worker_lock_key("bluesky_firehose_worker_singleton")
 
         def operation(connection: psycopg.Connection[Any]) -> bool:
             with connection.cursor() as cursor:
+                released_any = False
                 cursor.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
-                return bool((cursor.fetchone() or [False])[0])
+                released_any = released_any or bool((cursor.fetchone() or [False])[0])
+                cursor.execute("SELECT pg_advisory_unlock(%s)", (global_lock_key,))
+                released_any = released_any or bool((cursor.fetchone() or [False])[0])
+                return released_any
 
         return self._execute_write("release_worker_lease", operation)
 
@@ -983,6 +1038,58 @@ class PostgresStore:
                 )
                 cursor.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS public.topic_ai_enrichments (
+                        id BIGSERIAL PRIMARY KEY,
+                        topic_key TEXT NOT NULL,
+                        as_of_window_end TIMESTAMPTZ NOT NULL,
+                        raw_label TEXT NOT NULL,
+                        canonical_name TEXT NOT NULL,
+                        short_description TEXT NOT NULL,
+                        context_paragraph TEXT NOT NULL,
+                        key_entities JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        trend_category TEXT,
+                        summary_confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        supporting_post_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        supporting_sample JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        representative_post_count INTEGER NOT NULL DEFAULT 0,
+                        model_name TEXT NOT NULL,
+                        prompt_version TEXT NOT NULL,
+                        input_hash TEXT NOT NULL,
+                        generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        refreshed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        expires_at TIMESTAMPTZ,
+                        metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        CONSTRAINT topic_ai_enrichments_summary_confidence_range
+                            CHECK (summary_confidence >= 0 AND summary_confidence <= 1)
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_topic_ai_enrichments_topic_window
+                    ON public.topic_ai_enrichments (topic_key, as_of_window_end)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_topic_ai_enrichments_topic_generated
+                    ON public.topic_ai_enrichments (topic_key, generated_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_topic_ai_enrichments_refreshed
+                    ON public.topic_ai_enrichments (refreshed_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_topic_ai_enrichments_window_end
+                    ON public.topic_ai_enrichments (as_of_window_end DESC)
+                    """
+                )
+                cursor.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS public.topic_day_series_5m (
                         day DATE NOT NULL,
                         bucket_5m TIMESTAMPTZ NOT NULL,
@@ -1325,28 +1432,13 @@ class PostgresStore:
                           AND topic_key NOT IN ('all', 'general', 'digit')
                           AND NOT (topic_text_lc LIKE 'digit:%%in words:%%')
                           AND length(replace(topic_key, ' ', '')) >= 2
-                          AND token_count BETWEEN 1 AND 5
                           AND topic_key !~ '^[0-9]+$'
                           AND topic_key !~* '(^| )(https?|www|com|co|t|ly|amp)( |$)'
                           AND topic_key !~* '(^| )([a-z0-9]+bot)( |$)'
                           AND topic_key !~* '(area|forecast|discussion).*(afd|airnow|aqi)'
                           AND topic_key !~* '(additional|details) here'
-                          AND (
-                              token_count > 1
-                              OR (
-                                  topic_key NOT IN (SELECT token FROM weak_topic_tokens)
-                                  AND topic_key NOT IN (SELECT token FROM topic_noise_tokens)
-                                  AND topic_key NOT IN (SELECT token FROM number_word_tokens)
-                                  AND topic_key NOT IN (SELECT token FROM url_debris_tokens)
-                                  AND (
-                                      length(topic_key) >= 4
-                                      OR topic_key IN (SELECT token FROM acronym_allowlist)
-                                      OR topic_type IN ('cashtag', 'hashtag')
-                                  )
-                              )
-                          )
                           AND number_count < token_count
-                          AND informative_count > 0
+                          AND informative_count >= 1
                           AND url_count = 0
                           AND topic_confidence >= CASE
                               WHEN topic_type = 'cashtag' THEN 0.34
@@ -1498,6 +1590,7 @@ class PostgresStore:
                   ON t.topic_key = b.topic_key
                 WHERE (b.bucket_minute AT TIME ZONE 'utc')::date = %s::date
                 GROUP BY b.topic_key, COALESCE(t.canonical_label, INITCAP(b.topic_key))
+                HAVING SUM(b.mention_count) >= 2
                 """,
                 (day_value, day_value),
             )
@@ -1637,6 +1730,7 @@ class PostgresStore:
                   AND m.event_timestamp < %s::timestamptz
                   AND COALESCE(m.topic_confidence, 0) >= 0.34
                 GROUP BY m.topic_key, t.canonical_label
+                HAVING COUNT(*) >= 2
                 """,
                 (window_start, window_end, window_start, window_end),
             )
@@ -1793,6 +1887,337 @@ class PostgresStore:
                 }
 
         return self._execute_write("refresh_stable_topic_read_models", operation)
+
+    def fetch_top_topics_for_enrichment(self, *, limit: int = 250) -> list[dict[str, Any]]:
+        normalized_limit = max(1, int(limit))
+
+        def operation(connection: psycopg.Connection[Any]) -> list[dict[str, Any]]:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT to_regclass('public.topic_rolling_24h')")
+                relation = cursor.fetchone()
+                if not relation or relation[0] is None:
+                    return []
+
+                cursor.execute(
+                    """
+                    SELECT
+                        topic_key,
+                        topic_label,
+                        platform_count,
+                        total_mentions,
+                        unique_posts,
+                        unique_authors,
+                        positive_count,
+                        neutral_count,
+                        negative_count,
+                        window_start,
+                        window_end,
+                        updated_at
+                    FROM public.topic_rolling_24h
+                    ORDER BY total_mentions DESC, unique_posts DESC, topic_key ASC
+                    LIMIT %s
+                    """,
+                    (normalized_limit,),
+                )
+                rows = cursor.fetchall()
+
+            topics: list[dict[str, Any]] = []
+            for row in rows:
+                topics.append(
+                    {
+                        "topic_key": str(row[0] or "").strip(),
+                        "topic_label": str(row[1] or "").strip(),
+                        "platform_count": int(row[2] or 0),
+                        "total_mentions": int(row[3] or 0),
+                        "unique_posts": int(row[4] or 0),
+                        "unique_authors": int(row[5] or 0),
+                        "positive_count": int(row[6] or 0),
+                        "neutral_count": int(row[7] or 0),
+                        "negative_count": int(row[8] or 0),
+                        "window_start": row[9],
+                        "window_end": row[10],
+                        "updated_at": row[11],
+                    }
+                )
+
+            return [
+                row
+                for row in topics
+                if row.get("topic_key")
+            ]
+
+        return self._run_with_retry("fetch_top_topics_for_enrichment", operation)
+
+    def fetch_topic_post_candidates_for_enrichment(
+        self,
+        *,
+        topic_key: str,
+        limit: int = 120,
+        window_start: datetime | None = None,
+        window_end: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        normalized_topic_key = str(topic_key or "").strip()
+        if not normalized_topic_key:
+            return []
+        normalized_limit = max(1, int(limit))
+
+        def operation(connection: psycopg.Connection[Any]) -> list[dict[str, Any]]:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        to_regclass('public.post_topic_mentions'),
+                        to_regclass('public.processed_posts'),
+                        to_regclass('public.raw_posts')
+                    """
+                )
+                relations = cursor.fetchone() or (None, None, None)
+                if not relations[0]:
+                    return []
+
+                cursor.execute(
+                    """
+                    SELECT
+                        m.raw_post_id,
+                        m.processed_post_id,
+                        COALESCE(
+                            NULLIF(TRIM(rp.source_post_id), ''),
+                            NULLIF(TRIM(pp.source_post_id), ''),
+                            m.raw_post_id::text
+                        ) AS source_post_id,
+                        COALESCE(
+                            NULLIF(TRIM(rp.platform), ''),
+                            NULLIF(TRIM(pp.platform), ''),
+                            NULLIF(TRIM(m.platform), ''),
+                            'bluesky'
+                        ) AS platform,
+                        COALESCE(
+                            NULLIF(TRIM(pp.normalized_text), ''),
+                            NULLIF(TRIM(pp.clean_text), ''),
+                            NULLIF(TRIM(rp.text_content), ''),
+                            NULLIF(TRIM(rp.raw_text), '')
+                        ) AS text_content,
+                        COALESCE(NULLIF(TRIM(pp.fingerprint), ''), '') AS fingerprint,
+                        COALESCE(pp.quality_score, m.quality_score, 0)::double precision AS quality_score,
+                        COALESCE(rp.like_count, 0)::int AS like_count,
+                        COALESCE(rp.repost_count, 0)::int AS repost_count,
+                        COALESCE(rp.reply_count, 0)::int AS reply_count,
+                        COALESCE(
+                            NULLIF(rp.metrics_json ->> 'quoteCount', '')::int,
+                            NULLIF(rp.metrics_json ->> 'quote_count', '')::int,
+                            0
+                        )::int AS quote_count,
+                        COALESCE(NULLIF(TRIM(m.sentiment_label), ''), 'neutral') AS sentiment_label,
+                        COALESCE(
+                            NULLIF(TRIM(m.author_id), ''),
+                            NULLIF(TRIM(rp.author_id), ''),
+                            NULLIF(TRIM(pp.author_id), '')
+                        ) AS author_id,
+                        m.event_timestamp,
+                        COALESCE(m.topic_confidence, 0)::double precision AS topic_confidence,
+                        COALESCE(m.is_reply, false) AS is_reply,
+                        COALESCE(m.is_repost, false) AS is_repost,
+                        COALESCE(m.has_link, false) AS has_link
+                    FROM public.post_topic_mentions m
+                    LEFT JOIN public.processed_posts pp
+                      ON pp.id = m.processed_post_id
+                    LEFT JOIN public.raw_posts rp
+                      ON rp.id = m.raw_post_id
+                    WHERE m.topic_key = %s
+                      AND (%s::timestamptz IS NULL OR m.event_timestamp >= %s::timestamptz)
+                      AND (%s::timestamptz IS NULL OR m.event_timestamp < %s::timestamptz)
+                    ORDER BY
+                        m.event_timestamp DESC,
+                        COALESCE(pp.quality_score, m.quality_score, 0) DESC,
+                        m.raw_post_id DESC
+                    LIMIT %s
+                    """,
+                    (
+                        normalized_topic_key,
+                        window_start,
+                        window_start,
+                        window_end,
+                        window_end,
+                        normalized_limit,
+                    ),
+                )
+                rows = cursor.fetchall()
+
+            candidates: list[dict[str, Any]] = []
+            for row in rows:
+                candidates.append(
+                    {
+                        "raw_post_id": row[0],
+                        "processed_post_id": row[1],
+                        "source_post_id": str(row[2] or "").strip(),
+                        "platform": str(row[3] or "bluesky").strip() or "bluesky",
+                        "text_content": str(row[4] or "").strip(),
+                        "fingerprint": str(row[5] or "").strip(),
+                        "quality_score": float(row[6] or 0.0),
+                        "like_count": int(row[7] or 0),
+                        "repost_count": int(row[8] or 0),
+                        "reply_count": int(row[9] or 0),
+                        "quote_count": int(row[10] or 0),
+                        "sentiment_label": str(row[11] or "neutral").strip() or "neutral",
+                        "author_id": str(row[12] or "").strip() or None,
+                        "event_timestamp": row[13],
+                        "topic_confidence": float(row[14] or 0.0),
+                        "is_reply": bool(row[15]),
+                        "is_repost": bool(row[16]),
+                        "has_link": bool(row[17]),
+                    }
+                )
+
+            return candidates
+
+        return self._run_with_retry("fetch_topic_post_candidates_for_enrichment", operation)
+
+    def fetch_latest_topic_enrichment_state(
+        self,
+        *,
+        topic_keys: Sequence[str],
+    ) -> dict[str, dict[str, Any]]:
+        normalized_keys = [
+            str(topic_key or "").strip()
+            for topic_key in topic_keys
+            if str(topic_key or "").strip()
+        ]
+        if not normalized_keys:
+            return {}
+
+        def operation(connection: psycopg.Connection[Any]) -> dict[str, dict[str, Any]]:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT to_regclass('public.topic_ai_enrichments')")
+                relation = cursor.fetchone()
+                if not relation or relation[0] is None:
+                    return {}
+
+                cursor.execute(
+                    """
+                    SELECT DISTINCT ON (topic_key)
+                        topic_key,
+                        as_of_window_end,
+                        input_hash,
+                        prompt_version,
+                        model_name,
+                        generated_at,
+                        refreshed_at,
+                        expires_at,
+                        summary_confidence
+                    FROM public.topic_ai_enrichments
+                    WHERE topic_key = ANY(%s::text[])
+                    ORDER BY topic_key, as_of_window_end DESC, generated_at DESC
+                    """,
+                    (normalized_keys,),
+                )
+                rows = cursor.fetchall()
+
+            output: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                topic_key = str(row[0] or "").strip()
+                if not topic_key:
+                    continue
+                output[topic_key] = {
+                    "topic_key": topic_key,
+                    "as_of_window_end": row[1],
+                    "input_hash": str(row[2] or "").strip(),
+                    "prompt_version": str(row[3] or "").strip(),
+                    "model_name": str(row[4] or "").strip(),
+                    "generated_at": row[5],
+                    "refreshed_at": row[6],
+                    "expires_at": row[7],
+                    "summary_confidence": float(row[8] or 0.0),
+                }
+
+            return output
+
+        return self._run_with_retry("fetch_latest_topic_enrichment_state", operation)
+
+    def upsert_topic_ai_enrichment(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        payload = self._prepare_topic_ai_enrichment_row(row)
+        if not payload.get("topic_key"):
+            return None
+
+        def operation(connection: psycopg.Connection[Any]) -> dict[str, Any] | None:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO public.topic_ai_enrichments (
+                        topic_key,
+                        as_of_window_end,
+                        raw_label,
+                        canonical_name,
+                        short_description,
+                        context_paragraph,
+                        key_entities,
+                        trend_category,
+                        summary_confidence,
+                        supporting_post_ids,
+                        supporting_sample,
+                        representative_post_count,
+                        model_name,
+                        prompt_version,
+                        input_hash,
+                        generated_at,
+                        refreshed_at,
+                        expires_at,
+                        metadata_json
+                    ) VALUES (
+                        %(topic_key)s,
+                        %(as_of_window_end)s,
+                        %(raw_label)s,
+                        %(canonical_name)s,
+                        %(short_description)s,
+                        %(context_paragraph)s,
+                        %(key_entities)s,
+                        %(trend_category)s,
+                        %(summary_confidence)s,
+                        %(supporting_post_ids)s,
+                        %(supporting_sample)s,
+                        %(representative_post_count)s,
+                        %(model_name)s,
+                        %(prompt_version)s,
+                        %(input_hash)s,
+                        %(generated_at)s,
+                        %(refreshed_at)s,
+                        %(expires_at)s,
+                        %(metadata_json)s
+                    )
+                    ON CONFLICT (topic_key, as_of_window_end) DO UPDATE
+                    SET raw_label = EXCLUDED.raw_label,
+                        canonical_name = EXCLUDED.canonical_name,
+                        short_description = EXCLUDED.short_description,
+                        context_paragraph = EXCLUDED.context_paragraph,
+                        key_entities = EXCLUDED.key_entities,
+                        trend_category = EXCLUDED.trend_category,
+                        summary_confidence = EXCLUDED.summary_confidence,
+                        supporting_post_ids = EXCLUDED.supporting_post_ids,
+                        supporting_sample = EXCLUDED.supporting_sample,
+                        representative_post_count = EXCLUDED.representative_post_count,
+                        model_name = EXCLUDED.model_name,
+                        prompt_version = EXCLUDED.prompt_version,
+                        input_hash = EXCLUDED.input_hash,
+                        generated_at = EXCLUDED.generated_at,
+                        refreshed_at = EXCLUDED.refreshed_at,
+                        expires_at = EXCLUDED.expires_at,
+                        metadata_json = EXCLUDED.metadata_json
+                    RETURNING id, topic_key, as_of_window_end, input_hash, generated_at, refreshed_at
+                    """,
+                    payload,
+                )
+                row_out = cursor.fetchone()
+                if not row_out:
+                    return None
+                return {
+                    "id": int(row_out[0]),
+                    "topic_key": str(row_out[1] or "").strip(),
+                    "as_of_window_end": row_out[2],
+                    "input_hash": str(row_out[3] or "").strip(),
+                    "generated_at": row_out[4],
+                    "refreshed_at": row_out[5],
+                }
+
+        return self._execute_write("upsert_topic_ai_enrichment", operation)
 
     def cleanup_garbage_post_topic_mentions(self, *, lookback_hours: int = 168) -> int:
         lookback_hours = max(1, int(lookback_hours))
@@ -3187,32 +3612,6 @@ class PostgresStore:
                             ('statement'),
                             ('update')
                     ),
-                    single_word_topic_allowlist(token) AS (
-                        VALUES
-                            ('america'),
-                            ('biden'),
-                            ('bitcoin'),
-                            ('btc'),
-                            ('china'),
-                            ('crypto'),
-                            ('ethereum'),
-                            ('eth'),
-                            ('eu'),
-                            ('gaza'),
-                            ('iran'),
-                            ('israel'),
-                            ('maga'),
-                            ('palestine'),
-                            ('russia'),
-                            ('solana'),
-                            ('trump'),
-                            ('uk'),
-                            ('ukraine'),
-                            ('usa')
-                    ),
-                    single_word_topic_minimum(min_mentions) AS (
-                        VALUES (18)
-                    ),
                     topic_mentions_raw AS (
                         SELECT
                             date_trunc(
@@ -3301,7 +3700,6 @@ class PostgresStore:
                           AND normalized_topic NOT IN ('all', 'general')
                           AND normalized_topic NOT IN (SELECT token FROM weak_topic_tokens)
                           AND length(replace(normalized_topic, ' ', '')) >= 2
-                          AND array_length(string_to_array(normalized_topic, ' '), 1) <= 4
                           AND NOT EXISTS (
                               SELECT 1
                               FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
@@ -3396,7 +3794,6 @@ class PostgresStore:
                           AND normalized_topic NOT IN ('all', 'general')
                           AND normalized_topic NOT IN (SELECT token FROM weak_topic_tokens)
                           AND length(replace(normalized_topic, ' ', '')) >= 2
-                          AND array_length(string_to_array(normalized_topic, ' '), 1) <= 4
                           AND NOT EXISTS (
                               SELECT 1
                               FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
@@ -3406,21 +3803,6 @@ class PostgresStore:
                           AND normalized_topic !~* '(^| )([a-z0-9]+bot)( |$)'
                           AND normalized_topic !~* '(area|forecast|discussion).*(afd|airnow|aqi)'
                           AND normalized_topic !~* '(additional|details) here'
-                          AND (
-                              from_fallback = false
-                              OR normalized_topic IN (SELECT token FROM single_word_topic_allowlist)
-                              OR (
-                                  POSITION(' ' IN normalized_topic) > 0
-                                  AND (
-                                      SELECT COUNT(*)
-                                      FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
-                                      WHERE topic_token.token <> ''
-                                        AND topic_token.token NOT IN (SELECT token FROM weak_topic_tokens)
-                                        AND topic_token.token NOT IN (SELECT token FROM topic_noise_tokens)
-                                        AND length(topic_token.token) >= 4
-                                  ) >= 2
-                              )
-                          )
                           AND (
                               SELECT COUNT(*)
                               FROM unnest(string_to_array(normalized_topic, ' ')) AS topic_token(token)
@@ -3438,7 +3820,6 @@ class PostgresStore:
                                 AND topic_token.token NOT IN (SELECT token FROM topic_noise_tokens)
                                 AND (
                                     length(topic_token.token) >= 4
-                                    OR topic_token.token IN (SELECT token FROM single_word_topic_allowlist)
                                 )
                           )
                     ),
@@ -3476,19 +3857,7 @@ class PostgresStore:
                         JOIN topic_totals
                           ON topic_totals.platform = aggregated.platform
                          AND topic_totals.normalized_topic = aggregated.normalized_topic
-                        CROSS JOIN single_word_topic_minimum
-                        WHERE
-                            POSITION(' ' IN aggregated.normalized_topic) > 0
-                            OR aggregated.best_topic_priority <= 3
-                            OR (
-                                aggregated.best_topic_priority <= 4
-                                AND topic_totals.total_mentions >= 6
-                                AND aggregated.avg_quality_score >= 0.40
-                            )
-                            OR aggregated.normalized_topic IN (
-                                SELECT token FROM single_word_topic_allowlist
-                            )
-                            OR topic_totals.total_mentions >= single_word_topic_minimum.min_mentions
+                        WHERE topic_totals.total_mentions >= 2
                     )
                     INSERT INTO public.topic_buckets_1m (
                         bucket_minute,
@@ -3780,6 +4149,73 @@ class PostgresStore:
             "last_seen_at": last_seen,
         }
 
+    def _prepare_topic_ai_enrichment_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        topic_key = str(row.get("topic_key") or "").strip()
+        now_value = datetime.now(timezone.utc)
+        generated_at = row.get("generated_at") or now_value
+        refreshed_at = row.get("refreshed_at") or generated_at
+        summary_confidence_raw = row.get("summary_confidence")
+        try:
+            summary_confidence = float(summary_confidence_raw if summary_confidence_raw is not None else 0.0)
+        except (TypeError, ValueError):
+            summary_confidence = 0.0
+        summary_confidence = max(0.0, min(1.0, summary_confidence))
+
+        key_entities = row.get("key_entities")
+        if not isinstance(key_entities, list):
+            key_entities = []
+        normalized_entities = [
+            str(value or "").strip()
+            for value in key_entities
+            if str(value or "").strip()
+        ]
+
+        supporting_post_ids = row.get("supporting_post_ids")
+        if not isinstance(supporting_post_ids, list):
+            supporting_post_ids = []
+        normalized_post_ids = [
+            str(value or "").strip()
+            for value in supporting_post_ids
+            if str(value or "").strip()
+        ]
+
+        supporting_sample = row.get("supporting_sample")
+        if not isinstance(supporting_sample, list):
+            supporting_sample = []
+
+        metadata_json = row.get("metadata_json")
+        if not isinstance(metadata_json, dict):
+            metadata_json = {}
+
+        representative_post_count = row.get("representative_post_count")
+        try:
+            representative_post_count_value = int(representative_post_count or len(normalized_post_ids))
+        except (TypeError, ValueError):
+            representative_post_count_value = len(normalized_post_ids)
+        representative_post_count_value = max(0, representative_post_count_value)
+
+        return {
+            "topic_key": topic_key,
+            "as_of_window_end": row.get("as_of_window_end") or generated_at,
+            "raw_label": str(row.get("raw_label") or topic_key).strip() or topic_key,
+            "canonical_name": str(row.get("canonical_name") or row.get("raw_label") or topic_key).strip() or topic_key,
+            "short_description": str(row.get("short_description") or "").strip(),
+            "context_paragraph": str(row.get("context_paragraph") or "").strip(),
+            "key_entities": Jsonb(normalized_entities),
+            "trend_category": str(row.get("trend_category") or "").strip() or None,
+            "summary_confidence": summary_confidence,
+            "supporting_post_ids": Jsonb(normalized_post_ids),
+            "supporting_sample": Jsonb(supporting_sample),
+            "representative_post_count": representative_post_count_value,
+            "model_name": str(row.get("model_name") or "unknown").strip() or "unknown",
+            "prompt_version": str(row.get("prompt_version") or "v1").strip() or "v1",
+            "input_hash": str(row.get("input_hash") or "").strip(),
+            "generated_at": generated_at,
+            "refreshed_at": refreshed_at,
+            "expires_at": row.get("expires_at"),
+            "metadata_json": Jsonb(metadata_json),
+        }
+
     def _run_with_retry(
         self,
         label: str,
@@ -3852,6 +4288,7 @@ class PostgresStore:
                         "ingestion_runs",
                         "processed_posts",
                         "post_topics",
+                        "topic_ai_enrichments",
                     ],
                 ),
             )

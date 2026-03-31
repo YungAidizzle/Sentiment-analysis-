@@ -19,6 +19,10 @@ from backend.collectors.bluesky_worker import (
 from backend.config import WorkerConfig
 from backend.db import PostgresStore
 from backend.logging_setup import log_event, setup_logging
+from backend.trend_enrichment import (
+    build_trend_enrichment_runtime_config_from_env,
+    run_trend_enrichment_cycle,
+)
 
 
 def _utc_now() -> datetime:
@@ -178,7 +182,7 @@ def parse_args() -> argparse.Namespace:
         "--topic-aggregate-interval-seconds",
         type=float,
         default=None,
-        help="Minimum seconds between topic_buckets_1m refreshes. Set 0 to disable.",
+        help="Minimum seconds between stable topic read-model refreshes. Set 0 to disable.",
     )
     parser.add_argument(
         "--topic-cleanup-interval-seconds",
@@ -201,7 +205,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--aggregate-1m",
         action="store_true",
-        help="Aggregate raw_posts into metric_buckets_1m and exit.",
+        help="Refresh 1m metric buckets + stable topic read models once and exit.",
     )
     parser.add_argument(
         "--aggregate-1h",
@@ -268,13 +272,11 @@ def main() -> int:
             rows_1m = 0
             rows_1h = 0
             processed_rows = 0
-            topic_rows_1m = 0
             stable_fact_rows = 0
             stable_cleanup_rows = 0
             stable_refresh: dict[str, Any] | None = None
             if args.aggregate_1m:
                 processed_rows = store.refresh_processed_posts_from_raw_posts()
-                topic_rows_1m = store.aggregate_topic_buckets_1m_from_processed_posts()
                 stable_fact_rows = store.sync_post_topic_mentions_from_post_topics(
                     lookback_hours=config.topic_fact_sync_lookback_hours,
                 )
@@ -298,7 +300,6 @@ def main() -> int:
                     source=source,
                     rows_affected=rows_1m,
                     processed_rows_affected=processed_rows,
-                    topic_rows_affected=topic_rows_1m,
                     stable_fact_rows=stable_fact_rows,
                     stable_cleanup_rows=stable_cleanup_rows,
                     stable_refresh=stable_refresh,
@@ -322,7 +323,6 @@ def main() -> int:
                 rows_1m=rows_1m,
                 rows_1h=rows_1h,
                 processed_rows=processed_rows,
-                topic_rows_1m=topic_rows_1m,
                 stable_fact_rows=stable_fact_rows,
                 stable_cleanup_rows=stable_cleanup_rows,
                 stable_refresh=stable_refresh,
@@ -353,7 +353,9 @@ def main() -> int:
     last_raw_cleanup_at_monotonic = 0.0
     last_topic_aggregate_at_monotonic = 0.0
     last_topic_cleanup_at_monotonic = 0.0
+    last_trend_enrichment_at_monotonic = 0.0
     worker_lease_acquired = False
+    trend_enrichment_config = build_trend_enrichment_runtime_config_from_env()
 
     stop_requested = False
 
@@ -431,7 +433,6 @@ def main() -> int:
             or (started_monotonic - last_topic_cleanup_at_monotonic) >= cleanup_interval_seconds
         )
         try:
-            topic_rows_affected = store.aggregate_topic_buckets_1m_from_processed_posts()
             stable_fact_rows = store.sync_post_topic_mentions_from_post_topics(
                 lookback_hours=config.topic_fact_sync_lookback_hours,
             )
@@ -457,7 +458,6 @@ def main() -> int:
                 "topic_aggregation_complete",
                 cycle=cycle,
                 reason=reason,
-                rows_affected=topic_rows_affected,
                 stable_fact_rows=stable_fact_rows,
                 stable_cleanup_rows=stable_cleanup_rows,
                 cleanup_due=cleanup_due,
@@ -468,6 +468,8 @@ def main() -> int:
                 last_run_delta_seconds=since_last_seconds,
                 started_at=started_at,
             )
+            if reason != "shutdown":
+                run_trend_enrichment_if_due(force=force, reason=f"topic_aggregation:{reason}")
         except Exception as aggregation_error:
             duration_ms = round((time.monotonic() - started_monotonic) * 1000, 1)
             log_event(
@@ -486,6 +488,66 @@ def main() -> int:
             )
         finally:
             last_topic_aggregate_at_monotonic = started_monotonic
+
+    def run_trend_enrichment_if_due(*, force: bool = False, reason: str) -> None:
+        nonlocal last_trend_enrichment_at_monotonic
+        if not trend_enrichment_config.enabled:
+            return
+        if not trend_enrichment_config.openai_api_key:
+            log_event(
+                logger,
+                logging.WARNING,
+                "trend_enrichment_skipped_missing_api_key",
+                reason=reason,
+            )
+            return
+
+        now_monotonic = time.monotonic()
+        if (
+            not force
+            and last_trend_enrichment_at_monotonic > 0
+            and (now_monotonic - last_trend_enrichment_at_monotonic) < trend_enrichment_config.interval_seconds
+        ):
+            return
+
+        started_monotonic = time.monotonic()
+        try:
+            summary = run_trend_enrichment_cycle(
+                store=store,
+                logger=logger,
+                config=trend_enrichment_config,
+                reason=reason,
+            )
+            duration_ms = round((time.monotonic() - started_monotonic) * 1000, 1)
+            if summary.get("skipped"):
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "trend_enrichment_skipped",
+                    reason=reason,
+                    skip_reason=summary.get("reason"),
+                    duration_ms=duration_ms,
+                )
+            else:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "trend_enrichment_complete",
+                    reason=reason,
+                    duration_ms=duration_ms,
+                    summary=summary,
+                )
+            last_trend_enrichment_at_monotonic = now_monotonic
+        except Exception as enrichment_error:
+            log_event(
+                logger,
+                logging.ERROR,
+                "trend_enrichment_failed",
+                reason=reason,
+                error=str(enrichment_error),
+                duration_ms=round((time.monotonic() - started_monotonic) * 1000, 1),
+            )
+            last_trend_enrichment_at_monotonic = now_monotonic
 
     initial_notes = _build_run_notes(
         cycle=cycle,
@@ -522,6 +584,7 @@ def main() -> int:
             source=source,
             stale_after_minutes=config.worker_stale_run_minutes,
             closed_stale_runs=int(lease.get("closed_stale_runs") or 0),
+            closed_open_runs=int(lease.get("closed_open_runs") or 0),
         )
 
         store.create_ingestion_run(
@@ -556,6 +619,10 @@ def main() -> int:
             if args.topic_cleanup_interval_seconds is not None
             else config.topic_cleanup_interval_seconds
         ),
+        trend_enrichment_enabled=trend_enrichment_config.enabled,
+        trend_enrichment_interval_seconds=trend_enrichment_config.interval_seconds,
+        trend_enrichment_model=trend_enrichment_config.model_name,
+        trend_enrichment_prompt_version=trend_enrichment_config.prompt_version,
         worker_stale_run_minutes=config.worker_stale_run_minutes,
         raw_retention_hours=config.raw_retention_hours,
         raw_cleanup_interval_seconds=config.raw_cleanup_interval_seconds,

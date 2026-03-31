@@ -25,7 +25,7 @@ This worker runs independently from the frontend and continuously ingests Bluesk
 - `BLUESKY_WORKER_FIREHOSE_MAX_EVENTS_PER_CYCLE` (default: `12000`)
 - `BLUESKY_WORKER_LOOP_SLEEP_SECONDS` (default: `2`)
 - `BLUESKY_WORKER_RETRY_SECONDS` (default: `5`)
-- `BLUESKY_TOPIC_AGGREGATE_INTERVAL_SECONDS` (default: `20`; set `0` to disable periodic `topic_buckets_1m` refresh)
+- `BLUESKY_TOPIC_AGGREGATE_INTERVAL_SECONDS` (default: `20`; set `0` to disable periodic stable topic read-model refresh)
 - `BLUESKY_TOPIC_FACT_SYNC_LOOKBACK_HOURS` (default: `72`; max lookback window used to upsert `post_topic_mentions`)
 - `BLUESKY_TOPIC_READ_MODEL_LAG_MINUTES` (default: `3`; finalized-bucket lag for stable read models)
 - `BLUESKY_TOPIC_READ_MODEL_RECOMPUTE_HOURS` (default: `48`; recompute horizon for finalized minute buckets)
